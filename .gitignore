@@ -30,3 +30,7 @@ Desktop.ini
 
 # Optional local overrides
 config/*.local.php
+
+# Internal notes (keep local only; public docs stay in README.md)
+SYSTEM.md
+CURSOR_HANDOFF.md
