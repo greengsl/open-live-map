@@ -1,0 +1,32 @@
+# Local / secrets — never commit
+config.local.php
+config/mapillary.php
+config/monetization.php
+config/ui.php
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime data & caches
+cache/
+backup/
+tmp-video-frames/
+\#recycle/
+/#recycle/
+
+# Synology / OS junk
+@eaDir/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor / tooling
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.log
+
+# Optional local overrides
+config/*.local.php

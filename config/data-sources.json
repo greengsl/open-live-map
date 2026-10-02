@@ -1,0 +1,32 @@
+{
+  "garbage": {
+    "enabled": true,
+    "default_checked": true,
+    "label": "桃園環保車",
+    "description": "垃圾車、回收車 GPS"
+  },
+  "cctv-cache": {
+    "enabled": true,
+    "default_checked": false,
+    "label": "監視器",
+    "description": "保存點位，點擊時開啟影像"
+  },
+  "weather": {
+    "enabled": true,
+    "default_checked": false,
+    "label": "氣象測站",
+    "description": "中央氣象署 CWA 公開資料"
+  },
+  "realprice": {
+    "enabled": true,
+    "default_checked": false,
+    "label": "實價登錄",
+    "description": "內政部不動產成交批次資料"
+  },
+  "stale": {
+    "enabled": true,
+    "default_checked": true,
+    "label": "較舊移動資料",
+    "description": "公車、環保車等超過 10 分鐘資料"
+  }
+}
