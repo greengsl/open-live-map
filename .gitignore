@@ -31,6 +31,9 @@ Desktop.ini
 # Optional local overrides
 config/*.local.php
 
-# Internal notes (keep local only; public docs stay in README.md)
+# Internal notes (keep local only in the public repo; mirrored in private repo)
 SYSTEM.md
 CURSOR_HANDOFF.md
+
+# Scratch / private mirror workdir
+.docs-private-mirror/
