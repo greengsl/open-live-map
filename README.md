@@ -1,104 +1,82 @@
 # Open Live Map
 
-Live site: **[https://gslai.win/](https://gslai.win/)**
+Live demo: **[https://gslai.win/](https://gslai.win/)**
 
-A real-time public-data map for Taiwan, deployed on Synology Web Station / PHP 8.2 / Nginx.
-
-The site combines traffic CCTV, weather stations, real-price transactions (實價登錄), custom saved places, a monitor dock, on-demand Mapillary street view, and an admin console. Data comes mainly from open government sources and local caches; respect each provider’s rate limits and terms of use.
+A Taiwan-focused live map built with PHP + Leaflet, self-hosted (e.g. Synology Web Station). It layers open traffic CCTV, weather stations, real-estate transaction data (實價登錄), custom places, a multi-camera monitor dock, and optional Mapillary street view.
 
 ---
 
 ## English
 
-### Features
+### What you can do
 
-- Live map with selectable layers (CCTV, weather, real-price, older/stale motion data)
-- Pin monitors, save presets, custom CCTV, place search / saved locations
-- Optional Mapillary street view (admin toggle; coverage only while street-view mode is on)
-- Traditional Chinese / English UI (`?lang=` or language switch)
-- Admin tools for data import, diagnostics, appearance, monetization, Mapillary
+- Browse live CCTV, weather, and real-price layers on one map
+- Pin cameras, arrange a monitor dock, save presets
+- Search places and keep custom locations
+- Switch Traditional Chinese / English UI
+- Turn on Mapillary street view when coverage is available
+- Run an admin console for imports, appearance, and site settings
 
-### Key paths
-
-| Path | Role |
-|------|------|
-| `index.php` | Main map |
-| `admin/index.php` | Admin UI |
-| `api/` | JSON APIs for the frontend |
-| `lib/` | Import, cache, real-price, analytics, config helpers |
-| `assets/` | CSS, JS, i18n, icons |
-| `config.example.php` | Config template |
-| `config/*.example.php` | Feature config templates (copy locally; do not commit secrets) |
-| `cache/` | Local cache / imported data (not in git) |
-| `config.local.php` | Local secrets — **never publish** |
-
-### Deploy
-
-1. Put the project at the web root so it serves **[https://gslai.win/](https://gslai.win/)**.
-2. Use PHP 8.2 with `curl` enabled.
-3. Nginx index should include `index.php`.
-4. Admin: [https://gslai.win/admin/](https://gslai.win/admin/)
-
-### Data sources
-
-- **CCTV**: public city/highway feeds and user-submitted cameras (after review)
-- **Weather**: CWA open station data
-- **Real-price**: MOI transaction batch ZIPs, indexed locally
-- **Geocoding**: local/admin-area cache first; external geocoders only when needed
-- **Street view**: Mapillary (server-side token; on-demand lookup + coverage overlay)
-
-Prefer admin batch jobs, caching, incremental updates, and throttling over hitting remote APIs on every map move.
-
-### Useful URLs
+### Live demo
 
 - Map: [https://gslai.win/](https://gslai.win/)
-- Admin diagnose: [https://gslai.win/admin/?diagnose=1](https://gslai.win/admin/?diagnose=1)
-- Real-price API: `api/realprice.php`
-- CCTV report API: `api/cctv_report.php`
+
+### Self-host (short)
+
+1. Copy the project to your PHP 8.2 web root (`curl` enabled; Nginx/Apache index → `index.php`).
+2. Copy `config.example.php` → `config.local.php` and fill in local settings.
+3. Copy any needed `config/*.example.php` templates the same way (do not commit files that contain tokens or passwords).
+4. Open the site; use `/admin/` after you set an admin password in local config.
+
+`cache/` holds runtime data and is not part of the git tree.
+
+### Data sources (overview)
+
+| Layer | Typical source |
+|-------|----------------|
+| CCTV | Public city / highway feeds; optional user submissions after review |
+| Weather | CWA open station data |
+| Real-price | MOI batch ZIPs, indexed on the server |
+| Street view | Mapillary (optional; needs your own token) |
+
+Please follow each provider’s terms and rate limits. The app is built around local caches and batch import so the map does not hammer remote APIs on every pan/zoom.
 
 ### Notes
 
-- Do not commit `config.local.php`, `config/mapillary.php`, or `config/monetization.php`.
-- Live video may be limited by browser codecs, CORS, hotlink protection, or iframe rules.
-- iOS often cannot embed FLV; prefer HLS / MP4 / MJPEG or open the source page.
-- Treat official real-price batches as read-only; keep manual overrides in local overlay data.
+- Keep secrets in `config.local.php` (and related local config files) — never commit them.
+- Some camera streams may fail inside an iframe (codec, CORS, or hotlink rules). iOS often cannot play FLV embeds; HLS / MP4 / MJPEG or “open source page” works better.
 
 ---
 
 ## 中文
 
-公開資料即時地圖，部署於 Synology Web Station / PHP 8.2 / Nginx。
+線上試用：**[https://gslai.win/](https://gslai.win/)**
 
-線上網站：**[https://gslai.win/](https://gslai.win/)**
+以 PHP + Leaflet 自架的台灣公開資料即時地圖（可跑在 Synology Web Station）。整合交通監視器、氣象測站、實價登錄、自訂地點、多路監控清單，以及可選的 Mapillary 街景。
 
-整合交通監視器、氣象測站、實價登錄、自訂定位點、監控清單、Mapillary 街景與管理後台。資料以公開來源與本機快取為主；外部服務請遵守來源限制與使用條款。
+### 功能
 
-### 主要檔案
+- 地圖圖層：監視器、氣象、實價登錄等
+- 釘選監視器、監控清單、預設組合
+- 地點搜尋與自訂定位
+- 繁中／英文介面
+- 可選街景（Mapillary）
+- 管理後台：資料匯入、外觀與網站設定
 
-- `index.php`：地圖主頁
-- `admin/index.php`：管理介面
-- `api/`：前端 JSON API
-- `lib/`：匯入、快取、實價登錄、分析與設定
-- `assets/`：樣式、腳本、i18n、圖示
-- `config.local.php`：本機設定，**請勿公開**
-- `config.example.php` / `config/*.example.php`：設定範本
+### 自架（簡要）
 
-### 部署
+1. 放到 PHP 8.2 網站根目錄（需 `curl`；索引指向 `index.php`）。
+2. 複製 `config.example.php` → `config.local.php` 並填入本機設定。
+3. 依需要複製 `config/*.example.php`；含密鑰的檔案不要提交到 git。
+4. 開啟網站；在本機設定好管理員密碼後使用 `/admin/`。
 
-1. 網站根目錄對應 [https://gslai.win/](https://gslai.win/)
-2. PHP 8.2，啟用 `curl`
-3. Nginx 索引含 `index.php`
-4. 後台：[https://gslai.win/admin/](https://gslai.win/admin/)
+執行期資料放在 `cache/`（不在版本庫內）。
 
-### 資料來源
+### 資料來源概要
 
-- 監視器、氣象（CWA）、實價登錄批次、地址定位快取、Mapillary 街景（按需）
-- 匯入請走後台批次與快取，避免每次開圖大量打遠端
+監視器（縣市／國道公開影像）、氣象（中央氣象署開放資料）、實價登錄（內政部批次 ZIP 本機建索引）、街景（可選 Mapillary，需自備 token）。請遵守各來源條款與流量限制。
 
 ### 注意
 
-- 勿提交含密鑰的本機設定
-- 部分即時影像受格式／CORS／防盜連限制；iOS 不適合 FLV 內嵌
-- 實價登錄官方批次視為唯讀，人工修正放本機覆寫資料
-
-修改重要流程前，建議備份到 `backup/` 並記錄於 `backup/BACKUP_LOG.md`。
+- 密鑰只放本機設定檔，勿推上公開庫。
+- 部分影像受格式／CORS／防盜連限制；iOS 較不適合 FLV 內嵌。
