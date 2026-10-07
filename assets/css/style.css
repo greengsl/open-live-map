@@ -2997,25 +2997,83 @@ select option {
 .cctv-monitor-size {
     flex: 0 0 32px;
     width: 32px;
+    display: inline-grid;
+    place-items: center;
     color: #eef7fb;
     background: rgba(255, 255, 255, .14);
     font-size: 1.05rem;
 }
 
-.cctv-monitor-columns {
-    flex: 0 0 auto;
+.cctv-monitor-size svg,
+.cctv-monitor-info-toggle svg,
+.cctv-monitor-col-dec svg,
+.cctv-monitor-col-inc svg {
+    display: block;
+    width: 16px;
+    height: 16px;
+    margin: auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.cctv-monitor-info-toggle {
+    flex: 0 0 32px;
+    width: 32px;
     min-height: 30px;
+    display: inline-grid;
+    place-items: center;
     border: 0;
     border-radius: 7px;
-    padding: 0 8px;
-    color: #17212b;
-    background: var(--sun);
+    color: #eef7fb;
+    background: rgba(255, 255, 255, .14);
+    cursor: pointer;
+}
+
+.cctv-monitor-info-toggle.is-off {
+    color: #071815;
+    background: #49d0ae;
+}
+
+html.monitor-feed-info-hidden .cctv-monitor-overlay,
+html.monitor-feed-info-hidden .cctv-monitor-window > footer {
+    display: none !important;
+}
+
+.cctv-monitor-column-controls {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 4px;
+    align-items: center;
+}
+
+.cctv-monitor-col-dec,
+.cctv-monitor-col-inc {
+    flex: 0 0 32px;
+    width: 32px;
+    min-height: 30px;
+    display: inline-grid;
+    place-items: center;
+    border: 0;
+    border-radius: 7px;
+    color: #071815;
+    background: #49d0ae;
+    font-size: 1.05rem;
     font-weight: 900;
     cursor: pointer;
 }
 
-.cctv-monitor-columns {
-    max-width: 64px;
+.cctv-monitor-col-dec[hidden],
+.cctv-monitor-col-inc[hidden] {
+    display: none;
+}
+
+.cctv-monitor-col-dec:disabled,
+.cctv-monitor-col-inc:disabled {
+    opacity: .38;
+    cursor: not-allowed;
 }
 
 .cctv-monitor-clear {
@@ -3239,6 +3297,86 @@ select option {
     min-height: 118px;
     overflow: hidden;
     background: #0b1116;
+}
+
+.cctv-monitor-overlay {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 28px 8px 7px;
+    pointer-events: none;
+    background: linear-gradient(180deg, transparent 0%, rgba(5, 8, 9, .72) 72%);
+    color: rgba(238, 247, 251, .92);
+    font-size: .68rem;
+    line-height: 1.35;
+}
+
+.cctv-monitor-overlay-text {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+}
+
+.cctv-monitor-overlay-meta,
+.cctv-monitor-overlay-clock {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.cctv-monitor-overlay-clock {
+    color: rgba(242, 201, 76, .95);
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+}
+
+.cctv-monitor-health {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    margin-top: -18px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: #071815;
+    background: #f2c94c;
+    font-size: .62rem;
+    font-weight: 800;
+    letter-spacing: .02em;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+
+.cctv-monitor-health[data-status="live"] {
+    background: #49d0ae;
+}
+
+.cctv-monitor-health[data-status="waiting"] {
+    background: #f2c94c;
+}
+
+.cctv-monitor-health[data-status="stalled"] {
+    color: #fff8e8;
+    background: #d0893b;
+}
+
+.cctv-monitor-health[data-status="error"] {
+    color: #fff8e8;
+    background: #bf5b4e;
+}
+
+.cctv-monitor-health[data-status="external"] {
+    color: #eef7fb;
+    background: rgba(255, 255, 255, .22);
+}
+
+
+.cctv-monitor-window[data-health="stalled"],
+.cctv-monitor-window[data-health="error"] {
+    box-shadow: 0 0 0 1px rgba(191, 91, 78, .55), var(--shadow);
 }
 
 .cctv-monitor-window iframe {
@@ -3594,13 +3732,16 @@ select option {
         flex-basis: 30px;
     }
 
-    .cctv-monitor-size {
+    .cctv-monitor-size,
+    .cctv-monitor-info-toggle {
         flex-basis: 28px;
         width: 28px;
     }
 
-    .cctv-monitor-columns {
-        max-width: 58px;
+    .cctv-monitor-col-dec,
+    .cctv-monitor-col-inc {
+        flex-basis: 28px;
+        width: 28px;
     }
 
     .cctv-monitor-collapse {

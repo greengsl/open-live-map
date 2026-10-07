@@ -505,6 +505,7 @@ function doorplateDownloadCity(string $cityKey): array
     );
     $meta['last_message'] = ($source['label'] ?? $cityKey) . ' 門牌資料已下載：' . realpriceHumanSize($result['size']);
     doorplateSaveMeta($meta);
+    doorplateEnsureSearchIndex($cityKey);
     return doorplateStatus();
 }
 
@@ -1541,6 +1542,7 @@ function doorplateSaveUploadedCsv(string $cityKey, array $file): array
     );
     $meta['last_message'] = ($sources[$cityKey]['label'] ?? $cityKey) . ' 門牌 CSV 已上傳：' . realpriceHumanSize($size);
     doorplateSaveMeta($meta);
+    doorplateEnsureSearchIndex($cityKey);
     return doorplateStatus();
 }
 
@@ -1548,6 +1550,127 @@ function doorplateSaveUploadedCsv(string $cityKey, array $file): array
  * Register a CSV that was copied manually into cache/realprice/doorplate/{city}.csv
  * (useful when browser upload hits Synology PHP size limits).
  */
+function doorplateSearchIndexPath(string $cityKey): string
+{
+    $dir = doorplateDir() . '/search-index';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    return $dir . '/' . preg_replace('/[^a-z0-9_]/', '', $cityKey) . '.json';
+}
+
+/**
+ * Build / refresh map search index (api/geocode.php doorplate lookup).
+ */
+function doorplateRebuildSearchIndex(string $cityKey): array
+{
+    @set_time_limit(0);
+    @ini_set('memory_limit', '1024M');
+
+    $sources = doorplateSources();
+    if (!isset($sources[$cityKey])) {
+        throw new InvalidArgumentException('未知縣市：' . $cityKey);
+    }
+    $source = $sources[$cityKey];
+    $path = doorplateCsvPath($cityKey);
+    if (!is_file($path)) {
+        throw new RuntimeException(($source['label'] ?? $cityKey) . ' 尚未有門牌 CSV，無法建立搜尋索引。');
+    }
+
+    $fh = fopen($path, 'rb');
+    if ($fh === false) {
+        throw new RuntimeException('無法讀取門牌 CSV：' . $path);
+    }
+    $bom = fread($fh, 3);
+    if ($bom !== "\xEF\xBB\xBF") {
+        rewind($fh);
+    }
+    $headers = fgetcsv($fh);
+    if (!is_array($headers)) {
+        fclose($fh);
+        throw new RuntimeException('門牌 CSV 沒有標題列。');
+    }
+    $cols = doorplateDetectColumns($headers);
+    if (!isset($cols['full_address']) && (!isset($cols['street']) || !isset($cols['number']))) {
+        fclose($fh);
+        throw new RuntimeException('門牌 CSV 找不到街路/門牌欄位（或完整地址欄）。');
+    }
+    if (!isset($cols['x'], $cols['y']) && !isset($cols['lat'], $cols['lng'])) {
+        fclose($fh);
+        throw new RuntimeException('門牌 CSV 找不到座標欄位。');
+    }
+
+    $aliases = array_values(array_filter(array_map(
+        static fn ($value): string => realpriceNormalizeAddress((string) $value),
+        array_merge([(string) ($source['label'] ?? '')], is_array($source['city_aliases'] ?? null) ? $source['city_aliases'] : [])
+    )));
+    $alias = $aliases[0] ?? realpriceNormalizeAddress((string) ($source['label'] ?? ''));
+    $coordMode = (string) ($source['coord'] ?? 'twd97');
+    $items = [];
+    $rows = 0;
+    while (($row = fgetcsv($fh)) !== false) {
+        if (!is_array($row) || count($row) < 3) {
+            continue;
+        }
+        $rows++;
+        $streetNumber = doorplateBuildStreetNumber($row, $cols);
+        if ($streetNumber === '' || !str_contains($streetNumber, '號')) {
+            continue;
+        }
+        $ll = doorplateRowLatLng($row, $cols, $coordMode);
+        if ($ll === null) {
+            continue;
+        }
+        $key = $streetNumber;
+        if (isset($items[$key])) {
+            continue;
+        }
+        $items[$key] = [
+            'name' => $key,
+            'display_name' => $alias . $key,
+            'lat' => round((float) $ll['lat'], 7),
+            'lng' => round((float) $ll['lng'], 7),
+        ];
+    }
+    fclose($fh);
+
+    $payload = [
+        'generated_at' => date(DATE_ATOM),
+        'source' => basename($path),
+        'encoding' => 'utf-8-sig',
+        'rows' => $rows,
+        'count' => count($items),
+        'items' => $items,
+    ];
+    realpriceSaveJsonFile(doorplateSearchIndexPath($cityKey), $payload);
+
+    return [
+        'city' => $cityKey,
+        'rows' => $rows,
+        'count' => count($items),
+        'path' => doorplateSearchIndexPath($cityKey),
+    ];
+}
+
+function doorplateEnsureSearchIndex(string $cityKey): bool
+{
+    $indexPath = doorplateSearchIndexPath($cityKey);
+    $csvPath = doorplateCsvPath($cityKey);
+    if (!is_file($csvPath)) {
+        return false;
+    }
+    if (is_file($indexPath) && filemtime($indexPath) >= filemtime($csvPath)) {
+        return true;
+    }
+    try {
+        doorplateRebuildSearchIndex($cityKey);
+        return true;
+    } catch (Throwable $e) {
+        realpriceOpLog('doorplate_search_index', $e->getMessage(), ['city' => $cityKey], 'error');
+        return false;
+    }
+}
+
 function doorplateRegisterLocalCsv(string $cityKey): array
 {
     $sources = doorplateSources();
@@ -1578,5 +1701,6 @@ function doorplateRegisterLocalCsv(string $cityKey): array
         . ' 已登記本機門牌 CSV：' . realpriceHumanSize($size)
         . '（' . basename($path) . '）';
     doorplateSaveMeta($meta);
+    doorplateEnsureSearchIndex($cityKey);
     return doorplateStatus();
 }

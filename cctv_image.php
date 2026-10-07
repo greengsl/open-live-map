@@ -32,10 +32,12 @@ function h(string $value): string
 </head>
 <body>
     <img id="cctvImage" src="<?= h($src) ?>" alt="<?= h($title) ?>">
+    <script src="assets/js/cctv-embed-bridge.js?v=2"></script>
     <script>
         const baseSrc = <?= json_encode($src, JSON_UNESCAPED_SLASHES) ?>;
         const isMjpeg = <?= $isMjpeg ? 'true' : 'false' ?>;
         const image = document.getElementById('cctvImage');
+        window.OlmCctvBridge?.attach(image);
         if (!isMjpeg) {
             setInterval(() => {
                 image.src = `${baseSrc}${baseSrc.includes('?') ? '&' : '?'}_=${Date.now()}`;

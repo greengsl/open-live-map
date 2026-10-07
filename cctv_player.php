@@ -67,12 +67,15 @@ function h(string $value): string
 <body>
 <?php if ($src !== ''): ?>
     <video id="player" controls autoplay muted playsinline></video>
+    <script src="assets/js/cctv-embed-bridge.js?v=2"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
     <script>
         const src = <?= json_encode($src, JSON_UNESCAPED_SLASHES) ?>;
         const openUrl = <?= json_encode($open, JSON_UNESCAPED_SLASHES) ?>;
         const video = document.querySelector('#player');
+        window.OlmCctvBridge?.attach(video);
         function showMessage(text) {
+            window.OlmCctvBridge?.setHealth('error', text);
             const link = openUrl ? `<a href="${openUrl}" target="_blank" rel="noopener">開啟來源影像</a>` : '';
             document.body.innerHTML = `<div class="message"><strong>${text}</strong>${link}</div>`;
         }
@@ -84,7 +87,9 @@ function h(string $value): string
             hls.attachMedia(video);
             hls.on(Hls.Events.ERROR, (event, data) => {
                 if (data?.fatal) showMessage('影像來源暫時無法內嵌播放。');
+                else window.OlmCctvBridge?.setHealth('stalled', '串流不穩');
             });
+            hls.on(Hls.Events.FRAG_LOADED, () => window.OlmCctvBridge?.markFrame());
         } else {
             showMessage('此瀏覽器不支援 HLS 影像。');
         }

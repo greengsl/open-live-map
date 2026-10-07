@@ -51,6 +51,7 @@ function h(string $value): string
         <?php endif; ?>
     </main>
     <?php if ($src !== ''): ?>
+    <script src="assets/js/cctv-embed-bridge.js?v=2"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/flv.js/1.6.2/flv.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script>
         const streamUrl = <?= json_encode($src, JSON_UNESCAPED_SLASHES) ?>;
@@ -60,15 +61,18 @@ function h(string $value): string
         let player = null;
         let hasFrame = false;
         let notice = null;
+        window.OlmCctvBridge?.attach(video);
 
         function showMessage(title, detail) {
             if (hasFrame) return;
+            window.OlmCctvBridge?.setHealth('error', title);
             const link = openUrl ? `<a href="${openUrl}" target="_blank" rel="noopener">開啟來源影像</a>` : '';
             stage.innerHTML = `<div class="message"><strong>${title}</strong><small>${detail}</small>${link}</div>`;
         }
 
         function showNotice(detail) {
             if (hasFrame) return;
+            window.OlmCctvBridge?.setHealth('waiting', detail);
             const link = openUrl ? `<a href="${openUrl}" target="_blank" rel="noopener">開啟來源</a>` : '';
             if (!notice) {
                 notice = document.createElement('div');
@@ -89,6 +93,7 @@ function h(string $value): string
             hasFrame = true;
             notice?.remove();
             notice = null;
+            window.OlmCctvBridge?.markFrame();
         }, { once: true });
 
         if (!window.flvjs || !flvjs.isSupported()) {
@@ -108,6 +113,7 @@ function h(string $value): string
             video.play().catch(() => {});
             player.on(flvjs.Events.ERROR, () => {
                 showNotice('內嵌串流連線不穩，來源頁可能仍可播放。');
+                window.OlmCctvBridge?.setHealth('stalled', '串流連線不穩');
             });
             setTimeout(() => {
                 showNotice('尚未收到第一個影像畫面，仍在等待串流。');

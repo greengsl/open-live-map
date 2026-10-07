@@ -73,9 +73,12 @@ $streamUrl = fetch_ntpc_stream_url($device);
                 <strong>影像暫時無法取得</strong>
                 <small>來源 API 未回傳可播放串流，請稍後再試。</small>
             </div>
+            <script src="assets/js/cctv-embed-bridge.js?v=2"></script>
+            <script>window.OlmCctvBridge?.setHealth('error', '影像暫時無法取得');</script>
         <?php endif; ?>
     </main>
     <?php if ($streamUrl !== ''): ?>
+    <script src="assets/js/cctv-embed-bridge.js?v=2"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/flv.js/1.6.2/flv.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script>
         const streamUrl = <?= json_encode($streamUrl, JSON_UNESCAPED_SLASHES) ?>;
@@ -83,13 +86,16 @@ $streamUrl = fetch_ntpc_stream_url($device);
         const stage = document.querySelector('.stage');
         let hasFrame = false;
         let notice = null;
+        window.OlmCctvBridge?.attach(video);
 
         function showMessage(title, detail) {
+            window.OlmCctvBridge?.setHealth('error', title);
             stage.innerHTML = `<div class="message"><strong>${title}</strong><small>${detail}</small></div>`;
         }
 
         function showNotice(detail) {
             if (hasFrame) return;
+            window.OlmCctvBridge?.setHealth('waiting', detail);
             if (!notice) {
                 notice = document.createElement('div');
                 notice.className = 'notice';
@@ -102,6 +108,7 @@ $streamUrl = fetch_ntpc_stream_url($device);
             hasFrame = true;
             notice?.remove();
             notice = null;
+            window.OlmCctvBridge?.markFrame();
         }, { once: true });
 
         if (!window.flvjs || !flvjs.isSupported()) {
@@ -121,6 +128,7 @@ $streamUrl = fetch_ntpc_stream_url($device);
             video.play().catch(() => {});
             player.on(flvjs.Events.ERROR, () => {
                 showNotice('內嵌串流連線不穩，來源可能仍可播放。');
+                window.OlmCctvBridge?.setHealth('stalled', '串流連線不穩');
             });
             setTimeout(() => {
                 showNotice('尚未收到第一個影像畫面，仍在等待串流。');

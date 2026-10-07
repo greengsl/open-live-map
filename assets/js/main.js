@@ -350,6 +350,12 @@ const measureIconSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.
 const clearMeasureIconSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.2"></circle><path d="m9 9 6 6M15 9l-6 6"></path></svg>';
 const pinIconSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 4 6 6"></path><path d="m14.5 9.5-5 5"></path><path d="m9 3 12 12"></path><path d="M5 21l4.5-6.5"></path><path d="m9 3-2 2 4 4-4 4 4 4 4-4 4 4 2-2Z"></path></svg>';
 const unpinIconSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 4 20 11"></path><path d="m13.5 9.5-4.5 4.5"></path><path d="m8 4-2 2 4 4-4 4 4 4 4-4 4 4 2-2Z"></path><path d="M4 21l5-7"></path><path d="M15 5h4v4"></path><path d="M19 5 13 11"></path></svg>';
+const monitorSizeDownSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.6"></rect></svg>';
+const monitorSizeUpSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="4.5" width="15" height="15" rx="1.6"></rect><path d="M12 8.2v7.6M8.2 12h7.6"></path></svg>';
+const monitorColDownSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="5" height="14" rx="1"></rect><rect x="10.5" y="5" width="5" height="14" rx="1"></rect><path d="M17.2 12h3.8"></path></svg>';
+const monitorColUpSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="5" height="14" rx="1"></rect><rect x="10.5" y="5" width="5" height="14" rx="1"></rect><path d="M19.2 8.8v6.4M16 12h6.4"></path></svg>';
+const monitorInfoOnSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="1.6"></rect><path d="M6.5 14h11M6.5 17h7.5"></path></svg>';
+const monitorInfoOffSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="1.6"></rect><path d="M6.5 14h11M6.5 17h7.5M5 5.5l14 13"></path></svg>';
 const basemaps = {
     light: {
         label: t('js.basemap.light'),
@@ -2165,9 +2171,28 @@ function monitorWindowSize() {
     }
 }
 
+function monitorDockAvailableWidth() {
+    // Match CSS dock cap: min(..., calc(100% - 148px))
+    const parent = cctvMonitorDock?.parentElement;
+    const base = parent?.clientWidth || window.innerWidth || 1200;
+    return Math.max(220, Math.round(base - 148));
+}
+
+function monitorDockMaxColumns() {
+    if (window.matchMedia('(max-width: 560px)').matches) return 1;
+    const cardWidth = monitorWindowSize().width;
+    const gap = 10;
+    const chrome = 8;
+    const available = monitorDockAvailableWidth();
+    // width = card*cols + gap*(cols-1) + chrome <= available
+    const max = Math.floor((available + gap - chrome) / (cardWidth + gap));
+    return Math.max(1, max);
+}
+
 function monitorDockColumns() {
     const columns = Number(monitorDockState().columns);
-    return Math.max(1, Math.min(4, Number.isFinite(columns) ? Math.round(columns) : 1));
+    const max = monitorDockMaxColumns();
+    return Math.max(1, Math.min(max, Number.isFinite(columns) ? Math.round(columns) : 1));
 }
 
 function applyMonitorDockLayout() {
@@ -2177,8 +2202,29 @@ function applyMonitorDockLayout() {
     document.documentElement.style.setProperty('--cctv-monitor-width', `${width}px`);
     document.documentElement.style.setProperty('--cctv-monitor-columns', String(columns));
     document.documentElement.style.setProperty('--cctv-monitor-dock-width', `${(width * columns) + (gap * Math.max(0, columns - 1)) + 8}px`);
-    const columnSelect = cctvMonitorDock?.querySelector('.cctv-monitor-columns');
-    if (columnSelect) columnSelect.value = String(monitorDockColumns());
+    syncMonitorColumnButtons();
+}
+
+function syncMonitorColumnButtons() {
+    const columns = monitorDockColumns();
+    const max = monitorDockMaxColumns();
+    const dec = cctvMonitorDock?.querySelector('.cctv-monitor-col-dec');
+    const inc = cctvMonitorDock?.querySelector('.cctv-monitor-col-inc');
+    if (dec) {
+        dec.hidden = columns <= 1;
+        dec.disabled = columns <= 1;
+    }
+    if (inc) {
+        inc.hidden = false;
+        inc.disabled = columns >= max;
+        inc.title = columns >= max
+            ? t('js.monitor.columnsMax')
+            : t('js.monitor.addColumn');
+    }
+}
+
+function adjustMonitorDockColumns(delta) {
+    setMonitorDockColumns(monitorDockColumns() + Number(delta || 0));
 }
 
 function monitorDockHeightBounds() {
@@ -2229,7 +2275,8 @@ function adjustMonitorWindowSize(delta) {
 }
 
 function setMonitorDockColumns(columns) {
-    saveMonitorDockState({ columns: Math.max(1, Math.min(4, Math.round(Number(columns) || 1))) });
+    const max = monitorDockMaxColumns();
+    saveMonitorDockState({ columns: Math.max(1, Math.min(max, Math.round(Number(columns) || 1))) });
     applyMonitorDockLayout();
     applyMonitorDockState();
     scheduleMonitorDockOverflowCheck();
@@ -2429,10 +2476,35 @@ function saveMonitorDockState(patch = {}) {
     return next;
 }
 
+function monitorFeedInfoHidden() {
+    return Boolean(monitorDockState().hideFeedInfo);
+}
+
+function applyMonitorFeedInfoVisibility() {
+    const hidden = monitorFeedInfoHidden();
+    document.documentElement.classList.toggle('monitor-feed-info-hidden', hidden);
+    const button = cctvMonitorDock?.querySelector('.cctv-monitor-info-toggle');
+    if (button) {
+        button.classList.toggle('is-off', hidden);
+        button.setAttribute('aria-pressed', String(hidden));
+        const label = hidden ? t('js.monitor.showFeedInfo') : t('js.monitor.hideFeedInfo');
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.innerHTML = hidden ? monitorInfoOffSvg : monitorInfoOnSvg;
+    }
+}
+
+function setMonitorFeedInfoHidden(hidden) {
+    saveMonitorDockState({ hideFeedInfo: Boolean(hidden) });
+    applyMonitorFeedInfoVisibility();
+    scheduleMonitorDockOverflowCheck();
+}
+
 function applyMonitorDockState() {
     if (!cctvMonitorDock) return;
     const state = monitorDockState();
     applyMonitorDockHeight(state);
+    applyMonitorFeedInfoVisibility();
     cctvMonitorDock.classList.toggle('collapsed', Boolean(state.collapsed));
     if (Number.isFinite(Number(state.left)) && Number.isFinite(Number(state.top))) {
         const parent = cctvMonitorDock.parentElement?.getBoundingClientRect();
@@ -2602,14 +2674,13 @@ function ensureCctvMonitorDockControls(count) {
             </div>
             <div class="cctv-monitor-control-row cctv-monitor-action-row">
                 <button type="button" class="cctv-monitor-clear" title="${t('js.monitor.clearAll')}" aria-label="${t('js.monitor.clearAll')}">×</button>
-                <button type="button" class="cctv-monitor-size" data-size-delta="-40" title="${t('js.monitor.shrinkFeed')}" aria-label="${t('js.monitor.shrinkFeed')}">−</button>
-                <button type="button" class="cctv-monitor-size" data-size-delta="40" title="${t('js.monitor.growFeed')}" aria-label="${t('js.monitor.growFeed')}">+</button>
-                <select class="cctv-monitor-columns" title="${t('js.monitor.columns')}" aria-label="${t('js.monitor.columns')}">
-                    <option value="1">${t('js.monitor.colN', { n: 1 })}</option>
-                    <option value="2">${t('js.monitor.colN', { n: 2 })}</option>
-                    <option value="3">${t('js.monitor.colN', { n: 3 })}</option>
-                    <option value="4">${t('js.monitor.colN', { n: 4 })}</option>
-                </select>
+                <button type="button" class="cctv-monitor-size" data-size-delta="-40" title="${t('js.monitor.shrinkFeed')}" aria-label="${t('js.monitor.shrinkFeed')}">${monitorSizeDownSvg}</button>
+                <button type="button" class="cctv-monitor-size" data-size-delta="40" title="${t('js.monitor.growFeed')}" aria-label="${t('js.monitor.growFeed')}">${monitorSizeUpSvg}</button>
+                <button type="button" class="cctv-monitor-info-toggle" title="${t('js.monitor.hideFeedInfo')}" aria-label="${t('js.monitor.hideFeedInfo')}" aria-pressed="false">${monitorInfoOnSvg}</button>
+                <span class="cctv-monitor-column-controls" title="${t('js.monitor.columns')}">
+                    <button type="button" class="cctv-monitor-col-dec" title="${t('js.monitor.removeColumn')}" aria-label="${t('js.monitor.removeColumn')}" hidden>${monitorColDownSvg}</button>
+                    <button type="button" class="cctv-monitor-col-inc" title="${t('js.monitor.addColumn')}" aria-label="${t('js.monitor.addColumn')}">${monitorColUpSvg}</button>
+                </span>
             </div>
         `;
         cctvMonitorDock.prepend(controls);
@@ -2626,12 +2697,17 @@ function ensureCctvMonitorDockControls(count) {
                 button.focus({ preventScroll: true });
             });
         });
-        controls.querySelector('.cctv-monitor-columns')?.addEventListener('click', (event) => {
+        controls.querySelector('.cctv-monitor-info-toggle')?.addEventListener('click', (event) => {
             event.stopPropagation();
+            setMonitorFeedInfoHidden(!monitorFeedInfoHidden());
         });
-        controls.querySelector('.cctv-monitor-columns')?.addEventListener('change', (event) => {
+        controls.querySelector('.cctv-monitor-col-dec')?.addEventListener('click', (event) => {
             event.stopPropagation();
-            setMonitorDockColumns(event.currentTarget.value);
+            adjustMonitorDockColumns(-1);
+        });
+        controls.querySelector('.cctv-monitor-col-inc')?.addEventListener('click', (event) => {
+            event.stopPropagation();
+            adjustMonitorDockColumns(1);
         });
         controls.querySelector('.cctv-monitor-collapse')?.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -2639,9 +2715,18 @@ function ensureCctvMonitorDockControls(count) {
         });
     }
     applyMonitorDockLayout();
+    applyMonitorFeedInfoVisibility();
     const countEl = controls.querySelector('.cctv-monitor-title span');
     if (countEl) countEl.textContent = t('js.monitor.countN', { n: count });
     setMonitorDockCollapsed(Boolean(monitorDockState().collapsed));
+    // Upgrade older dock markup (columns <select> or plain +/- text buttons).
+    const needsIconUpgrade = !controls.querySelector('.cctv-monitor-size svg')
+        || controls.querySelector('select.cctv-monitor-columns')
+        || !controls.querySelector('.cctv-monitor-info-toggle');
+    if (needsIconUpgrade) {
+        controls.remove();
+        return ensureCctvMonitorDockControls(count);
+    }
 }
 
 function ensureCctvMonitorStrip() {
@@ -3011,6 +3096,95 @@ function ensurePinnedMonitorLayer() {
     return pinnedMonitorLayer;
 }
 
+function isOlmCctvEmbedUrl(url) {
+    return /^(cctv_player|cctv_image|ntpc_cctv_player|flv_cctv_player)\.php\?/i.test(String(url || ''));
+}
+
+function monitorClockText(date = new Date()) {
+    try {
+        return date.toLocaleString('zh-TW', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        });
+    } catch (_) {
+        return date.toISOString();
+    }
+}
+
+function monitorHealthLabel(status) {
+    if (status === 'live') return t('js.monitor.health.live');
+    if (status === 'waiting') return t('js.monitor.health.waiting');
+    if (status === 'stalled') return t('js.monitor.health.stalled');
+    if (status === 'error') return t('js.monitor.health.error');
+    if (status === 'external') return t('js.monitor.health.external');
+    return t('js.monitor.health.waiting');
+}
+
+function setMonitorCardHealth(card, status, detail = '') {
+    if (!card) return;
+    card.dataset.health = status || 'waiting';
+    const badge = card.querySelector('.cctv-monitor-health');
+    if (!badge) return;
+    badge.dataset.status = status || 'waiting';
+    badge.textContent = monitorHealthLabel(status);
+    badge.title = detail || monitorHealthLabel(status);
+}
+
+function updateMonitorCardOverlays(card, vehicle = null) {
+    if (!card) return;
+    const clock = card.querySelector('.cctv-monitor-overlay-clock');
+    if (clock) clock.textContent = monitorClockText();
+    if (!vehicle) return;
+    const title = vehicle.route || vehicle.plate || t('js.monitor.liveTitle');
+    const source = cctvSourceLabel(vehicle);
+    const coords = Number.isFinite(Number(vehicle.lat)) && Number.isFinite(Number(vehicle.lng))
+        ? `${Number(vehicle.lat).toFixed(5)}, ${Number(vehicle.lng).toFixed(5)}`
+        : '';
+    const line = card.querySelector('.cctv-monitor-overlay-meta');
+    if (line) {
+        line.textContent = [title, source, coords].filter(Boolean).join(' · ');
+    }
+}
+
+let monitorOverlayClockTimer = 0;
+
+function ensureMonitorOverlayClock() {
+    if (monitorOverlayClockTimer) return;
+    monitorOverlayClockTimer = window.setInterval(() => {
+        document.querySelectorAll('.cctv-monitor-window').forEach((card) => {
+            updateMonitorCardOverlays(card);
+        });
+    }, 1000);
+}
+
+function findMonitorCardByIframeSource(sourceWindow) {
+    const cards = document.querySelectorAll('.cctv-monitor-window');
+    for (const card of cards) {
+        const iframe = card.querySelector('iframe');
+        if (iframe && iframe.contentWindow === sourceWindow) return card;
+    }
+    return null;
+}
+
+function initMonitorEmbedBridge() {
+    window.addEventListener('message', (event) => {
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'olm-cctv-health') {
+            const card = findMonitorCardByIframeSource(event.source);
+            if (card) setMonitorCardHealth(card, data.status || 'waiting', data.detail || '');
+        }
+    });
+}
+
+initMonitorEmbedBridge();
+ensureMonitorOverlayClock();
+
 function monitorCardHtml({ pinned = false } = {}) {
     return `
         <header>
@@ -3026,6 +3200,13 @@ function monitorCardHtml({ pinned = false } = {}) {
         </header>
         <div class="cctv-monitor-frame">
             <iframe loading="lazy" referrerpolicy="strict-origin-when-cross-origin" scrolling="no" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
+            <div class="cctv-monitor-overlay" aria-hidden="true">
+                <span class="cctv-monitor-health" data-status="waiting">${t('js.monitor.health.waiting')}</span>
+                <div class="cctv-monitor-overlay-text">
+                    <span class="cctv-monitor-overlay-meta"></span>
+                    <span class="cctv-monitor-overlay-clock"></span>
+                </div>
+            </div>
             <div class="cctv-monitor-fallback" hidden>
                 <strong></strong>
                 <small></small>
@@ -3071,10 +3252,18 @@ function updateMonitorCardContent(card, vehicle, index = 0, count = 1) {
             iframe.removeAttribute('src');
         } else if (iframe.getAttribute('src') !== mediaUrl) {
             iframe.src = mediaUrl;
+            if (isOlmCctvEmbedUrl(mediaUrl)) setMonitorCardHealth(card, 'waiting');
+            else setMonitorCardHealth(card, 'external');
+        } else if (!isOlmCctvEmbedUrl(mediaUrl)) {
+            setMonitorCardHealth(card, 'external');
+        } else if (!card.dataset.health) {
+            setMonitorCardHealth(card, 'waiting');
         }
     }
     if (fallback) {
         fallback.hidden = canEmbed;
+        const overlay = card.querySelector('.cctv-monitor-overlay');
+        if (overlay) overlay.hidden = !canEmbed;
         const fallbackTitle = fallback.querySelector('strong');
         const fallbackDetail = fallback.querySelector('small');
         const fallbackLink = fallback.querySelector('a');
@@ -3085,6 +3274,7 @@ function updateMonitorCardContent(card, vehicle, index = 0, count = 1) {
         if (fallbackLink) fallbackLink.href = openUrl;
     }
     if (link) link.href = openUrl;
+    updateMonitorCardOverlays(card, vehicle);
 }
 
 function bindMonitorCardActions(card, vehicle, options = {}) {

@@ -36,6 +36,26 @@ function realpriceGeocodeCachePath(): string
     return realpriceDir() . '/geocode-cache.json';
 }
 
+/** TGOS 批次匯入增量（避免每批重寫巨大的 geocode-cache.json） */
+function realpriceGeocodeTgosOverlayPath(): string
+{
+    return realpriceDir() . '/geocode-tgos-overlay.json';
+}
+
+function realpriceLoadGeocodeTgosOverlay(): array
+{
+    return realpriceLoadJsonFile(realpriceGeocodeTgosOverlayPath(), ['items' => [], 'updated_at' => '']);
+}
+
+function realpriceSaveGeocodeTgosOverlay(array $overlay): void
+{
+    $overlay['updated_at'] = date(DATE_ATOM);
+    if (!isset($overlay['items']) || !is_array($overlay['items'])) {
+        $overlay['items'] = [];
+    }
+    realpriceSaveJsonFile(realpriceGeocodeTgosOverlayPath(), $overlay);
+}
+
 function realpriceGeocodeQueuePath(): string
 {
     return realpriceDir() . '/geocode-queue.json';
@@ -181,24 +201,55 @@ function realpriceListSeasonZipPaths(): array
 /**
  * Inventory of local season ZIPs under cache/realprice/seasons（含手動放入的歷史季）.
  *
- * @return list<array{season:string,file:string,path:string,size:int,mtime:string}>
+ * @return list<array{season:string,file:string,path:string,size:int,mtime:string,mtime_ts:int,index_status:string,indexed_records:int,indexed_at:string,index_note:string}>
  */
 function realpriceListLocalSeasons(): array
 {
+    $meta = realpriceLoadMeta();
+    $indexed = is_array($meta['indexed_seasons'] ?? null) ? $meta['indexed_seasons'] : [];
     $rows = [];
     foreach (realpriceListSeasonZipPaths() as $path) {
         $base = basename($path, '.zip');
+        $file = basename($path);
         $season = strtoupper(preg_replace('/[^0-9Ss]/', '', $base) ?? '');
         if ($season === '') {
             $season = $base;
         }
-        $mtime = @filemtime($path);
+        $mtime = @filemtime($path) ?: 0;
+        $size = (int) filesize($path);
+        $info = is_array($indexed[$file] ?? null) ? $indexed[$file] : (is_array($indexed[$season] ?? null) ? $indexed[$season] : []);
+        $indexedRecords = (int) ($info['records'] ?? 0);
+        $indexedAt = (string) ($info['indexed_at'] ?? '');
+        $indexedSize = (int) ($info['size'] ?? 0);
+        $indexedMtime = (int) ($info['mtime_ts'] ?? 0);
+        $status = 'pending';
+        $note = '尚未索引';
+        if ($indexedRecords > 0 || $indexedAt !== '') {
+            if ($indexedMtime > 0 && $mtime > $indexedMtime) {
+                $status = 'stale';
+                $note = 'ZIP 已更新，建議重建';
+            } elseif ($indexedSize > 0 && $indexedSize !== $size) {
+                $status = 'stale';
+                $note = 'ZIP 大小變更，建議重建';
+            } elseif ($indexedRecords > 0) {
+                $status = 'ok';
+                $note = '已索引 ' . number_format($indexedRecords) . ' 筆';
+            } else {
+                $status = 'empty';
+                $note = '已跑過但 0 筆（請檢查 ZIP）';
+            }
+        }
         $rows[] = [
             'season' => $season,
-            'file' => basename($path),
+            'file' => $file,
             'path' => $path,
-            'size' => (int) filesize($path),
+            'size' => $size,
             'mtime' => $mtime ? date('Y-m-d H:i', $mtime) : '',
+            'mtime_ts' => $mtime,
+            'index_status' => $status,
+            'indexed_records' => $indexedRecords,
+            'indexed_at' => $indexedAt,
+            'index_note' => $note,
         ];
     }
     return $rows;
@@ -413,10 +464,10 @@ function realpriceDownloadRecentSeasons(int $seasonCount = 5): array
     $meta['last_download_changed'] = true;
     $meta['notice'] = '已下載 ' . count($downloaded) . ' 個季度批次'
         . ($currentOk ? '（含本期）' : '')
-        . '，接著重建索引。';
+        . '。請接著執行分批重建索引。';
     realpriceSaveMeta($meta);
 
-    return realpriceBuildIndex();
+    return realpriceStatus();
 }
 
 function realpriceCheckRemoteUpdate(): array
@@ -1501,7 +1552,30 @@ function realpriceGeocodeKey(string $address): string
 
 function realpriceLoadGeocodeCache(): array
 {
-    return realpriceLoadJsonFile(realpriceGeocodeCachePath(), ['items' => []]);
+    $cache = realpriceLoadJsonFile(realpriceGeocodeCachePath(), ['items' => []]);
+    $items = is_array($cache['items'] ?? null) ? $cache['items'] : [];
+    $overlay = realpriceLoadGeocodeTgosOverlay();
+    $overlayItems = is_array($overlay['items'] ?? null) ? $overlay['items'] : [];
+    if ($overlayItems !== []) {
+        foreach ($overlayItems as $key => $hit) {
+            if (!is_string($key) || $key === '' || !is_array($hit)) {
+                continue;
+            }
+            $existing = is_array($items[$key] ?? null) ? $items[$key] : null;
+            if ($existing
+                && (($existing['provider'] ?? '') === 'doorplate_opendata' || ($existing['provider'] ?? '') === 'local_override')
+                && (($existing['precision'] ?? '') !== 'district')
+            ) {
+                continue;
+            }
+            $items[$key] = $hit;
+        }
+        $cache['items'] = $items;
+        if (!empty($overlay['updated_at'])) {
+            $cache['overlay_updated_at'] = $overlay['updated_at'];
+        }
+    }
+    return $cache;
 }
 
 function realpriceLoadGeocodeQueue(): array
@@ -1636,14 +1710,428 @@ function realpriceOpLogClear(): void
     realpriceOpLog('clear_log', '已清空操作日誌。', [], 'info');
 }
 
+function realpriceCoverageJobPath(): string
+{
+    return realpriceDir() . '/coverage-job.json';
+}
+
+function realpriceCoverageJobDbPath(): string
+{
+    return realpriceDir() . '/coverage-job.sqlite';
+}
+
+function realpriceCoverageJobSignature(): string
+{
+    $indexPath = is_file(realpriceSqlitePath()) ? realpriceSqlitePath() : realpriceIndexPath();
+    $cachePath = realpriceGeocodeCachePath();
+    $overlayPath = realpriceGeocodeTgosOverlayPath();
+    return implode('|', [
+        is_file($indexPath) ? ((string) filesize($indexPath) . '|' . (string) filemtime($indexPath)) : '0',
+        is_file($cachePath) ? ((string) filesize($cachePath) . '|' . (string) filemtime($cachePath)) : '0',
+        is_file($overlayPath) ? ((string) filesize($overlayPath) . '|' . (string) filemtime($overlayPath)) : '0',
+    ]);
+}
+
+function realpriceLoadCoverageJob(): array
+{
+    return realpriceLoadJsonFile(realpriceCoverageJobPath(), [
+        'status' => 'idle',
+        'signature' => '',
+        'last_rowid' => 0,
+        'scanned_rows' => 0,
+        'unique' => 0,
+        'precise' => 0,
+        'district_fallback' => 0,
+        'missing' => 0,
+        'by_provider' => [],
+        'by_city' => [],
+        'message' => '',
+        'pct' => 0,
+        'total_rows' => 0,
+        'started_at' => '',
+        'updated_at' => '',
+    ]);
+}
+
+function realpriceSaveCoverageJob(array $job): void
+{
+    $job['updated_at'] = date(DATE_ATOM);
+    realpriceSaveJsonFile(realpriceCoverageJobPath(), $job);
+}
+
+function realpriceCoverageJobOpenDb(bool $create = false): ?PDO
+{
+    $path = realpriceCoverageJobDbPath();
+    if (!$create && !is_file($path)) {
+        return null;
+    }
+    $pdo = new PDO('sqlite:' . $path, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+    if ($create) {
+        $pdo->exec('PRAGMA journal_mode=WAL');
+        $pdo->exec('PRAGMA synchronous=NORMAL');
+        $pdo->exec('CREATE TABLE IF NOT EXISTS seen (k TEXT PRIMARY KEY)');
+        $pdo->exec('CREATE TABLE IF NOT EXISTS geo (
+            k TEXT PRIMARY KEY,
+            provider TEXT,
+            precision TEXT,
+            city TEXT,
+            district TEXT,
+            query TEXT,
+            display_name TEXT,
+            address TEXT
+        )');
+    }
+    return $pdo;
+}
+
+function realpriceCoverageJobStart(): array
+{
+    @set_time_limit(60);
+    if (!is_file(realpriceSqlitePath()) && !is_file(realpriceIndexPath())) {
+        throw new RuntimeException('尚未建立實價登錄索引。');
+    }
+    if (!is_file(realpriceSqlitePath()) || !class_exists('PDO')) {
+        throw new RuntimeException('覆蓋統計需要 SQLite 索引。請先重建實價登錄索引。');
+    }
+
+    @unlink(realpriceCoverageJobDbPath());
+    $jobDb = realpriceCoverageJobOpenDb(true);
+    if (!$jobDb instanceof PDO) {
+        throw new RuntimeException('無法建立覆蓋統計暫存資料庫。');
+    }
+
+    $totalRows = 0;
+    $src = realpriceOpenSqliteReadonly();
+    if ($src instanceof PDO) {
+        try {
+            // MAX(rowid) is enough for progress and avoids slow COUNT(*) on large tables.
+            $totalRows = (int) $src->query('SELECT MAX(rowid) FROM records')->fetchColumn();
+        } catch (Throwable $e) {
+            $totalRows = 0;
+        }
+    }
+
+    $job = [
+        'status' => 'running',
+        'phase' => 'warm_geo',
+        'signature' => realpriceCoverageJobSignature(),
+        'geo_last_key' => '',
+        'geo_indexed' => 0,
+        'geo_total' => 0,
+        'last_rowid' => 0,
+        'scanned_rows' => 0,
+        'unique' => 0,
+        'precise' => 0,
+        'district_fallback' => 0,
+        'missing' => 0,
+        'by_provider' => [],
+        'by_city' => [],
+        'message' => '開始分批統計覆蓋：先索引座標快取…',
+        'pct' => 0,
+        'total_rows' => $totalRows,
+        'started_at' => date(DATE_ATOM),
+    ];
+    realpriceSaveCoverageJob($job);
+    return $job;
+}
+
+function realpriceCoverageJobWarmGeo(PDO $jobDb, array &$job, float $deadline): array
+{
+    $cache = realpriceLoadGeocodeCache();
+    $cachedItems = is_array($cache['items'] ?? null) ? $cache['items'] : [];
+    $geoTotal = count($cachedItems);
+    $job['geo_total'] = $geoTotal;
+    if ($geoTotal === 0) {
+        $job['phase'] = 'scan';
+        $job['message'] = '座標快取為空，開始掃描索引…';
+        $job['pct'] = 5;
+        return ['warmed' => 0, 'phase_done' => true];
+    }
+
+    $lastKey = (string) ($job['geo_last_key'] ?? '');
+    $skipping = $lastKey !== '';
+    $ins = $jobDb->prepare(
+        'INSERT OR REPLACE INTO geo(k, provider, precision, city, district, query, display_name, address)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    $jobDb->beginTransaction();
+    $warmed = 0;
+    $indexed = (int) ($job['geo_indexed'] ?? 0);
+    $phaseDone = true;
+    foreach ($cachedItems as $key => $hit) {
+        $key = (string) $key;
+        if ($skipping) {
+            if ($key === $lastKey) {
+                $skipping = false;
+            }
+            continue;
+        }
+        if (!is_array($hit)) {
+            continue;
+        }
+        $ins->execute([
+            $key,
+            (string) ($hit['provider'] ?? ''),
+            (string) ($hit['precision'] ?? ''),
+            (string) ($hit['city'] ?? ''),
+            (string) ($hit['district'] ?? ''),
+            (string) ($hit['query'] ?? ''),
+            (string) ($hit['display_name'] ?? ''),
+            (string) ($hit['address'] ?? ''),
+        ]);
+        $lastKey = $key;
+        $warmed++;
+        $indexed++;
+        if (($warmed % 2000) === 0 && microtime(true) >= $deadline) {
+            $phaseDone = false;
+            break;
+        }
+    }
+    $jobDb->commit();
+
+    $job['geo_last_key'] = $lastKey;
+    $job['geo_indexed'] = $indexed;
+    if ($phaseDone) {
+        $job['phase'] = 'scan';
+        $job['geo_last_key'] = '';
+        $job['message'] = '座標快取已索引（' . number_format($indexed) . '），開始掃描實價列…';
+        $job['pct'] = 8;
+    } else {
+        $job['message'] = '索引座標快取 ' . number_format($indexed) . ' / ' . number_format($geoTotal) . '…';
+        $job['pct'] = $geoTotal > 0 ? min(7.9, round(($indexed / $geoTotal) * 8, 1)) : 1;
+    }
+    return ['warmed' => $warmed, 'phase_done' => $phaseDone];
+}
+
+function realpriceCoverageJobChunk(int $timeBudgetMs = 12000): array
+{
+    @set_time_limit(75);
+    @ini_set('memory_limit', '768M');
+    $job = realpriceLoadCoverageJob();
+    if (($job['status'] ?? '') !== 'running') {
+        return [
+            'job' => $job,
+            'done' => true,
+            'message' => (string) ($job['message'] ?? '目前沒有進行中的覆蓋統計。'),
+            'coverage' => realpriceCoverageStats(false),
+        ];
+    }
+
+    $jobDb = realpriceCoverageJobOpenDb(false);
+    $src = realpriceOpenSqliteReadonly();
+    if (!$jobDb instanceof PDO || !$src instanceof PDO) {
+        throw new RuntimeException('覆蓋統計暫存或索引資料庫無法開啟。');
+    }
+
+    $deadline = microtime(true) + max(4, min(18, $timeBudgetMs / 1000));
+    $phase = (string) ($job['phase'] ?? 'warm_geo');
+
+    if ($phase !== 'scan') {
+        $warm = realpriceCoverageJobWarmGeo($jobDb, $job, $deadline);
+        realpriceSaveCoverageJob($job);
+        $phase = (string) ($job['phase'] ?? 'warm_geo');
+        if ($phase !== 'scan' || microtime(true) >= ($deadline - 1.5)) {
+            return [
+                'job' => $job,
+                'done' => false,
+                'chunk' => [
+                    'phase' => 'warm_geo',
+                    'warmed' => (int) ($warm['warmed'] ?? 0),
+                    'pct' => (float) ($job['pct'] ?? 0),
+                ],
+                'message' => (string) $job['message'],
+                'coverage' => null,
+            ];
+        }
+        // warm finished with time left — continue into scan in this request
+    }
+
+    $precise = (int) ($job['precise'] ?? 0);
+    $districtFallback = (int) ($job['district_fallback'] ?? 0);
+    $missing = (int) ($job['missing'] ?? 0);
+    $unique = (int) ($job['unique'] ?? 0);
+    $byProvider = is_array($job['by_provider'] ?? null) ? $job['by_provider'] : [];
+    $byCity = is_array($job['by_city'] ?? null) ? $job['by_city'] : [];
+    $lastRowId = (int) ($job['last_rowid'] ?? 0);
+    $scanned = (int) ($job['scanned_rows'] ?? 0);
+    $totalRows = (int) ($job['total_rows'] ?? 0);
+
+    $insertSeen = $jobDb->prepare('INSERT OR IGNORE INTO seen(k) VALUES (?)');
+    $lookup = $jobDb->prepare(
+        'SELECT provider, precision, city, district, query, display_name, address FROM geo WHERE k = ?'
+    );
+    $stmt = $src->prepare(
+        'SELECT rowid AS rid, city, district, address
+         FROM records
+         WHERE rowid > ?
+         ORDER BY rowid
+         LIMIT 1200'
+    );
+
+    $batchScanned = 0;
+    $batchUnique = 0;
+    $done = false;
+
+    while (microtime(true) < $deadline) {
+        $stmt->execute([$lastRowId]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        if ($rows === []) {
+            $done = true;
+            break;
+        }
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $lastRowId = (int) ($row['rid'] ?? $lastRowId);
+            $batchScanned++;
+            $scanned++;
+            $address = realpriceNormalizeAddress((string) ($row['address'] ?? ''));
+            if ($address === '' || mb_strlen($address, 'UTF-8') < 5) {
+                continue;
+            }
+            $key = realpriceGeocodeKey($address);
+            $insertSeen->execute([$key]);
+            if ($insertSeen->rowCount() === 0) {
+                continue;
+            }
+            $batchUnique++;
+            $unique++;
+
+            $city = realpriceNormalizeAddress((string) ($row['city'] ?? '')) ?: '未分縣市';
+            $district = realpriceNormalizeAddress((string) ($row['district'] ?? ''));
+            if (!isset($byCity[$city]) || !is_array($byCity[$city])) {
+                $byCity[$city] = [
+                    'city' => $city,
+                    'total' => 0,
+                    'precise' => 0,
+                    'need_match' => 0,
+                    'doorplate' => 0,
+                    'tgos' => 0,
+                    'nominatim' => 0,
+                    'manual' => 0,
+                ];
+            }
+            $byCity[$city]['total']++;
+
+            $lookup->execute([$key]);
+            $existing = $lookup->fetch(PDO::FETCH_ASSOC);
+            $existing = is_array($existing) ? $existing : null;
+            $isPrecise = $existing
+                && !realpriceGeocodeHitIsDistrictFallback($existing, $city, $district)
+                && (($existing['precision'] ?? '') !== 'district');
+
+            if ($isPrecise) {
+                $precise++;
+                $byCity[$city]['precise']++;
+                $provider = (string) ($existing['provider'] ?? 'unknown');
+                $byProvider[$provider] = (int) ($byProvider[$provider] ?? 0) + 1;
+                if ($provider === 'doorplate_opendata') {
+                    $byCity[$city]['doorplate']++;
+                } elseif ($provider === 'tgos') {
+                    $byCity[$city]['tgos']++;
+                } elseif ($provider === 'local_override') {
+                    $byCity[$city]['manual']++;
+                } else {
+                    $byCity[$city]['nominatim']++;
+                }
+            } else {
+                $byCity[$city]['need_match']++;
+                if ($existing && ((($existing['precision'] ?? '') === 'district') || realpriceGeocodeHitIsDistrictFallback($existing, $city, $district))) {
+                    $districtFallback++;
+                } else {
+                    $missing++;
+                }
+            }
+        }
+    }
+
+    $job['last_rowid'] = $lastRowId;
+    $job['scanned_rows'] = $scanned;
+    $job['unique'] = $unique;
+    $job['precise'] = $precise;
+    $job['district_fallback'] = $districtFallback;
+    $job['missing'] = $missing;
+    $job['by_provider'] = $byProvider;
+    $job['by_city'] = $byCity;
+    if ($totalRows > 0) {
+        // warm_geo uses 0–8%; scan uses 8–99.9% (progress by rowid)
+        $scanPct = min(91.9, ($lastRowId / max(1, $totalRows)) * 91.9);
+        $job['pct'] = round(8 + $scanPct, 1);
+    } else {
+        $job['pct'] = $done ? 100 : 8;
+    }
+
+    $coverage = null;
+    if ($done) {
+        uasort($byCity, static fn (array $a, array $b): int => ($b['need_match'] <=> $a['need_match']) ?: ($b['total'] <=> $a['total']));
+        $need = $unique - $precise;
+        $stats = [
+            'signature' => (string) ($job['signature'] ?? realpriceCoverageJobSignature()),
+            'generated_at' => date(DATE_ATOM),
+            'unique_addresses' => $unique,
+            'precise_count' => $precise,
+            'need_match_count' => $need,
+            'district_fallback_count' => $districtFallback,
+            'missing_count' => $missing,
+            'precise_pct' => $unique > 0 ? round(($precise / $unique) * 100, 1) : 0,
+            'by_provider' => $byProvider,
+            'by_city' => array_values($byCity),
+            'message' => $unique > 0
+                ? ('精準門牌座標 ' . number_format($precise) . ' / ' . number_format($unique) . '（' . round(($precise / $unique) * 100, 1) . '%）；尚待比對 ' . number_format($need) . ' 筆。')
+                : '索引中沒有可統計的地址。',
+        ];
+        realpriceSaveJsonFile(realpriceCoverageStatsPath(), $stats);
+        $job['status'] = 'done';
+        $job['phase'] = 'done';
+        $job['pct'] = 100;
+        $job['message'] = (string) $stats['message'];
+        $coverage = $stats;
+        $jobDb = null;
+        @unlink(realpriceCoverageJobDbPath());
+    } else {
+        $job['message'] = '統計中 rowid ' . number_format($lastRowId)
+            . ($totalRows > 0 ? ' / ' . number_format($totalRows) : '')
+            . '（唯一地址 ' . number_format($unique) . '，精準 ' . number_format($precise) . '）…';
+    }
+    realpriceSaveCoverageJob($job);
+
+    return [
+        'job' => $job,
+        'done' => $done,
+        'chunk' => [
+            'phase' => 'scan',
+            'scanned' => $batchScanned,
+            'unique' => $batchUnique,
+            'pct' => (float) ($job['pct'] ?? 0),
+        ],
+        'message' => (string) $job['message'],
+        'coverage' => $coverage,
+    ];
+}
+
+function realpriceCoverageJobCancel(): array
+{
+    $job = realpriceLoadCoverageJob();
+    $job['status'] = 'cancelled';
+    $job['phase'] = 'cancelled';
+    $job['message'] = '已取消覆蓋統計。';
+    realpriceSaveCoverageJob($job);
+    @unlink(realpriceCoverageJobDbPath());
+    return $job;
+}
+
 /**
  * Summarize unique indexed addresses vs precise doorplate/manual/nominatim hits.
- * Cached to coverage-stats.json. Page load never full-scans; use $force=true to rebuild.
+ * Cached to coverage-stats.json. Page load never full-scans.
+ * Full rebuild is via realpriceCoverageJobStart/Chunk (AJAX) to avoid Synology 504.
  */
 function realpriceCoverageStats(bool $force = false): array
 {
     $indexPath = is_file(realpriceSqlitePath()) ? realpriceSqlitePath() : realpriceIndexPath();
-    $cachePath = realpriceGeocodeCachePath();
     if (!is_file($indexPath)) {
         return [
             'unique_addresses' => 0,
@@ -1659,33 +2147,25 @@ function realpriceCoverageStats(bool $force = false): array
         ];
     }
 
-    $signature = implode('|', [
-        (string) filesize($indexPath),
-        (string) filemtime($indexPath),
-        is_file($cachePath) ? ((string) filesize($cachePath) . '|' . (string) filemtime($cachePath)) : '0',
-    ]);
+    $signature = realpriceCoverageJobSignature();
     $path = realpriceCoverageStatsPath();
-    if (!$force && is_file($path)) {
+    if (is_file($path)) {
         $cached = realpriceLoadJsonFile($path, []);
         if (is_array($cached['by_city'] ?? null)) {
-            if (($cached['signature'] ?? '') === $signature) {
+            if (($cached['signature'] ?? '') === $signature && !$force) {
                 return $cached;
             }
-            // 索引／座標快取已變，但進頁不重算（避免 67 萬筆掃到 timeout）。
+            // 索引／座標快取已變，但進頁不重算（避免整庫掃描 timeout）。
             $cached['stale'] = true;
             $cached['message'] = (string) (($cached['message'] ?? '') !== ''
                 ? $cached['message']
                 : '定位覆蓋統計（可能過期）')
-                . ' 資料已更新，請按「更新覆蓋統計」重算。';
+                . ' 資料已更新，請按「重新統計覆蓋」重算。';
             return $cached;
         }
     }
 
-    if (!$force) {
-        return realpriceCoverageStatsQuick($signature);
-    }
-
-    return realpriceCoverageStatsRebuild($signature);
+    return realpriceCoverageStatsQuick($signature);
 }
 
 /** 輕量統計：用 map_points / meta，不掃全表。 */
@@ -1758,97 +2238,6 @@ function realpriceCoverageStatsQuick(string $signature = ''): array
             . '／索引 ' . number_format($indexed)
             . ' 筆。完整覆蓋表請按「更新覆蓋統計」。',
     ];
-}
-
-function realpriceCoverageStatsRebuild(string $signature): array
-{
-    @set_time_limit(0);
-    @ini_set('memory_limit', '1024M');
-
-    $records = realpriceIterateRecords();
-    $cache = realpriceLoadGeocodeCache();
-    $cachedItems = is_array($cache['items'] ?? null) ? $cache['items'] : [];
-
-    $seen = [];
-    $precise = 0;
-    $districtFallback = 0;
-    $missing = 0;
-    $byProvider = [];
-    $byCity = [];
-
-    foreach ($records as $record) {
-        $address = realpriceNormalizeAddress((string) ($record['address'] ?? ''));
-        if ($address === '' || mb_strlen($address, 'UTF-8') < 5) continue;
-        $key = realpriceGeocodeKey($address);
-        if (isset($seen[$key])) continue;
-        $seen[$key] = true;
-
-        $city = realpriceNormalizeAddress((string) ($record['city'] ?? '')) ?: '未分縣市';
-        $district = realpriceNormalizeAddress((string) ($record['district'] ?? ''));
-        if (!isset($byCity[$city])) {
-            $byCity[$city] = [
-                'city' => $city,
-                'total' => 0,
-                'precise' => 0,
-                'need_match' => 0,
-                'doorplate' => 0,
-                'tgos' => 0,
-                'nominatim' => 0,
-                'manual' => 0,
-            ];
-        }
-        $byCity[$city]['total']++;
-
-        $existing = is_array($cachedItems[$key] ?? null) ? $cachedItems[$key] : null;
-        $isPrecise = $existing
-            && !realpriceGeocodeHitIsDistrictFallback($existing, $city, $district)
-            && (($existing['precision'] ?? '') !== 'district');
-
-        if ($isPrecise) {
-            $precise++;
-            $byCity[$city]['precise']++;
-            $provider = (string) ($existing['provider'] ?? 'unknown');
-            $byProvider[$provider] = (int) ($byProvider[$provider] ?? 0) + 1;
-            if ($provider === 'doorplate_opendata') {
-                $byCity[$city]['doorplate']++;
-            } elseif ($provider === 'tgos') {
-                $byCity[$city]['tgos']++;
-            } elseif ($provider === 'local_override') {
-                $byCity[$city]['manual']++;
-            } else {
-                $byCity[$city]['nominatim']++;
-            }
-            continue;
-        }
-
-        $byCity[$city]['need_match']++;
-        if ($existing && ((($existing['precision'] ?? '') === 'district') || realpriceGeocodeHitIsDistrictFallback($existing, $city, $district))) {
-            $districtFallback++;
-        } else {
-            $missing++;
-        }
-    }
-
-    uasort($byCity, static fn (array $a, array $b): int => ($b['need_match'] <=> $a['need_match']) ?: ($b['total'] <=> $a['total']));
-    $unique = count($seen);
-    $need = $unique - $precise;
-    $stats = [
-        'signature' => $signature,
-        'generated_at' => date(DATE_ATOM),
-        'unique_addresses' => $unique,
-        'precise_count' => $precise,
-        'need_match_count' => $need,
-        'district_fallback_count' => $districtFallback,
-        'missing_count' => $missing,
-        'precise_pct' => $unique > 0 ? round(($precise / $unique) * 100, 1) : 0,
-        'by_provider' => $byProvider,
-        'by_city' => array_values($byCity),
-        'message' => $unique > 0
-            ? ('精準門牌座標 ' . number_format($precise) . ' / ' . number_format($unique) . '（' . round(($precise / $unique) * 100, 1) . '%）；尚待比對 ' . number_format($need) . ' 筆。')
-            : '索引中沒有可統計的地址。',
-    ];
-    realpriceSaveJsonFile(realpriceCoverageStatsPath(), $stats);
-    return $stats;
 }
 
 function realpriceBuildGeocodeQueue(int $limit = 1000): array
@@ -2268,7 +2657,7 @@ function realpriceAppendRecordsFromZip(string $zipPath, array &$records, array &
     }
 }
 
-function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $zipPath, array &$seen, int &$fileCount, int &$recordCount): void
+function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $zipPath, array &$seen, int &$fileCount, int &$recordCount, bool $useIgnore = false): int
 {
     $zip = new ZipArchive();
     if ($zip->open($zipPath) !== true) {
@@ -2276,6 +2665,7 @@ function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $
     }
     $cityMap = realpriceCityMap();
     $typeMap = realpriceTypeMap();
+    $added = 0;
     try {
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $name = (string) $zip->getNameIndex($i);
@@ -2298,6 +2688,13 @@ function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $
                 fclose($stream);
                 continue;
             }
+            $header = array_map(static function ($value): string {
+                $text = trim((string) $value);
+                if (str_starts_with($text, "\xEF\xBB\xBF")) {
+                    $text = substr($text, 3);
+                }
+                return $text;
+            }, $header);
             $fileCount++;
             while (($values = fgetcsv($stream)) !== false) {
                 if (!is_array($values) || count($values) < 8) continue;
@@ -2308,8 +2705,10 @@ function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $
                 $record = realpriceRecordFromRow($row, $cityCode, $typeMap[$typeCode], $base);
                 if (!$record) continue;
                 $dedupeKey = $record['id'] . '|' . $record['type'];
-                if (isset($seen[$dedupeKey])) continue;
-                $seen[$dedupeKey] = true;
+                if (!$useIgnore) {
+                    if (isset($seen[$dedupeKey])) continue;
+                    $seen[$dedupeKey] = true;
+                }
                 $insert->execute([
                     (string) $record['id'],
                     (string) $record['type'],
@@ -2328,6 +2727,7 @@ function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $
                     (float) $record['area_sqm'],
                     (string) $record['source_file'],
                 ]);
+                $added++;
                 $recordCount++;
             }
             fclose($stream);
@@ -2335,6 +2735,7 @@ function realpriceAppendRecordsToSqlite(PDO $pdo, PDOStatement $insert, string $
     } finally {
         $zip->close();
     }
+    return $added;
 }
 
 function realpriceBuildIndex(): array
@@ -2461,6 +2862,685 @@ function realpriceBuildIndex(): array
     realpriceSaveMeta($meta);
 
     return realpriceStatus();
+}
+
+function realpriceIndexJobStatePath(): string
+{
+    return realpriceDir() . '/index-job.json';
+}
+
+function realpriceListZipCsvTasks(string $zipPath): array
+{
+    $zip = new ZipArchive();
+    if ($zip->open($zipPath) !== true) {
+        throw new RuntimeException('實價登錄 ZIP 無法開啟：' . basename($zipPath));
+    }
+    $cityMap = realpriceCityMap();
+    $typeMap = realpriceTypeMap();
+    $tasks = [];
+    try {
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $name = (string) $zip->getNameIndex($i);
+            $base = basename($name);
+            if (!preg_match('/^([a-z])_lvr_land_([abc])\.csv$/i', $base, $matches)) {
+                continue;
+            }
+            $cityCode = strtolower($matches[1]);
+            $typeCode = strtolower($matches[2]);
+            if (!isset($cityMap[$cityCode], $typeMap[$typeCode])) {
+                continue;
+            }
+            $tasks[] = [
+                'zip' => $zipPath,
+                'zip_name' => basename($zipPath),
+                'entry' => $name,
+                'base' => $base,
+                'city' => $cityCode,
+                'type' => (string) $typeMap[$typeCode],
+            ];
+        }
+    } finally {
+        $zip->close();
+    }
+    return $tasks;
+}
+
+function realpriceIndexJobCreateSqlite(string $tmp): PDO
+{
+    @unlink($tmp);
+    $pdo = new PDO('sqlite:' . $tmp, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    ]);
+    $pdo->exec('PRAGMA journal_mode=OFF');
+    $pdo->exec('PRAGMA synchronous=OFF');
+    $pdo->exec(
+        'CREATE TABLE meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )'
+    );
+    $pdo->exec(
+        'CREATE TABLE records (
+            id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            date TEXT NOT NULL,
+            city TEXT NOT NULL,
+            city_code TEXT NOT NULL,
+            district TEXT NOT NULL,
+            target TEXT NOT NULL,
+            address TEXT NOT NULL,
+            building_type TEXT NOT NULL,
+            floor TEXT NOT NULL,
+            total_floors TEXT NOT NULL,
+            total_price INTEGER NOT NULL,
+            unit_price_sqm INTEGER NOT NULL,
+            unit_price_ping INTEGER NOT NULL,
+            area_sqm REAL NOT NULL,
+            source_file TEXT NOT NULL,
+            UNIQUE(id, type)
+        )'
+    );
+    return $pdo;
+}
+
+function realpriceIndexJobStart(array $selectedFiles = []): array
+{
+    if (!class_exists('ZipArchive')) {
+        throw new RuntimeException('PHP ZipArchive 未啟用，無法建立實價登錄索引。');
+    }
+    if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) {
+        throw new RuntimeException('PHP PDO SQLite 未啟用，無法建立實價登錄索引。');
+    }
+
+    $prev = realpriceLoadJsonFile(realpriceIndexJobStatePath(), []);
+    if (($prev['status'] ?? '') === 'running') {
+        $updated = strtotime((string) ($prev['updated_at'] ?? '')) ?: 0;
+        $age = $updated > 0 ? (time() - $updated) : PHP_INT_MAX;
+        if ($age < 45 && empty($prev['busy'])) {
+            $prev['message'] = '偵測到進行中的索引工作，改為繼續上次進度…'
+                . ((string) ($prev['current_label'] ?? '') !== ''
+                    ? ('（' . (string) $prev['current_label'] . '）')
+                    : '');
+            $prev['updated_at'] = date(DATE_ATOM);
+            realpriceSaveJsonFile(realpriceIndexJobStatePath(), $prev);
+            return [
+                'ok' => true,
+                'done' => false,
+                'resume' => true,
+                'job' => $prev,
+                'status' => realpriceStatus(),
+                'message' => $prev['message'],
+            ];
+        }
+        realpriceIndexJobCancel();
+    }
+
+    $allPaths = realpriceListSeasonZipPaths();
+    if (realpriceIsZipFile(realpriceZipPath())) {
+        $allPaths[] = realpriceZipPath();
+    }
+    $allPaths = array_values(array_unique($allPaths));
+    if ($allPaths === []) {
+        throw new RuntimeException('尚未下載實價登錄季度 ZIP。請先執行「下載／更新」。');
+    }
+
+    $selectedFiles = array_values(array_filter(array_map(
+        static fn ($value): string => basename(str_replace('\\', '/', (string) $value)),
+        $selectedFiles
+    )));
+    $zipPaths = [];
+    if ($selectedFiles === []) {
+        $zipPaths = $allPaths;
+    } else {
+        $want = array_fill_keys(array_map('strtolower', $selectedFiles), true);
+        foreach ($allPaths as $path) {
+            $base = strtolower(basename($path));
+            $season = strtolower(basename($path, '.zip'));
+            if (isset($want[$base]) || isset($want[$season]) || isset($want[$season . '.zip'])) {
+                $zipPaths[] = $path;
+            }
+        }
+    }
+    if ($zipPaths === []) {
+        throw new RuntimeException('沒有符合勾選條件的季度 ZIP。');
+    }
+
+    $dir = realpriceDir();
+    if (!is_dir($dir)) {
+        mkdir($dir, 0775, true);
+    }
+    $tmp = realpriceSqlitePath() . '.part.' . bin2hex(random_bytes(4));
+    $selectedOnly = $selectedFiles !== [];
+    $mergeExisting = false;
+    $seedStats = [];
+    $seedRecords = 0;
+    $seedFiles = 0;
+    $existingSqlite = realpriceSqlitePath();
+
+    // 勾選部分季度時：複製既有索引再追加，避免未勾選的季被整份蓋掉。
+    if ($selectedOnly && is_file($existingSqlite) && (int) filesize($existingSqlite) > 0) {
+        if (!@copy($existingSqlite, $tmp)) {
+            throw new RuntimeException('無法複製既有索引以合併季度，請改用「全部季度重建」。');
+        }
+        $mergeExisting = true;
+        $meta = realpriceLoadMeta();
+        $seedStats = is_array($meta['indexed_seasons'] ?? null) ? $meta['indexed_seasons'] : [];
+        try {
+            $pdoSeed = new PDO('sqlite:' . $tmp, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $pdoSeed->exec('PRAGMA journal_mode=OFF');
+            $pdoSeed->exec('PRAGMA synchronous=OFF');
+            $seedRecords = (int) $pdoSeed->query('SELECT COUNT(*) FROM records')->fetchColumn();
+            $pdoSeed = null;
+        } catch (Throwable $e) {
+            @unlink($tmp);
+            throw new RuntimeException('既有索引無法讀取，請改用「全部季度重建」。');
+        }
+        foreach ($seedStats as $stat) {
+            if (is_array($stat)) {
+                $seedFiles += (int) ($stat['files'] ?? 0);
+            }
+        }
+        $pdo = null;
+    } else {
+        $pdo = realpriceIndexJobCreateSqlite($tmp);
+        $pdo = null;
+    }
+
+    $msg = $mergeExisting
+        ? ('合併索引：保留既有 ' . number_format($seedRecords) . ' 筆，再處理 ' . count($zipPaths) . ' 個勾選 ZIP…')
+        : ('已建立索引工作，共 ' . count($zipPaths) . ' 個 ZIP，將逐季處理…');
+
+    $job = [
+        'started_at' => date(DATE_ATOM),
+        'updated_at' => date(DATE_ATOM),
+        'status' => 'running',
+        'tmp_sqlite' => $tmp,
+        'zip_paths' => $zipPaths,
+        'zip_count' => count($zipPaths),
+        'zip_index' => 0,
+        'selected_only' => $selectedOnly,
+        'merge_existing' => $mergeExisting,
+        'file_count' => $seedFiles,
+        'record_count' => $seedRecords,
+        'season_stats' => $seedStats,
+        'total_zip_bytes' => array_sum(array_map(
+            static fn (string $path): int => is_file($path) ? (int) filesize($path) : 0,
+            $zipPaths
+        )),
+        'current_label' => '',
+        'pct' => 0,
+        'message' => $msg,
+    ];
+    realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+
+    return [
+        'ok' => true,
+        'done' => false,
+        'job' => $job,
+        'status' => realpriceStatus(),
+        'message' => $job['message'],
+    ];
+}
+
+function realpriceIndexJobCancel(): array
+{
+    $job = realpriceLoadJsonFile(realpriceIndexJobStatePath(), []);
+    $tmp = (string) ($job['tmp_sqlite'] ?? '');
+    if ($tmp !== '' && is_file($tmp)) {
+        @unlink($tmp);
+    }
+    $job['status'] = 'cancelled';
+    $job['updated_at'] = date(DATE_ATOM);
+    $job['message'] = '索引重建已取消。';
+    $job['busy'] = false;
+    unset($job['busy_until'], $job['tasks']);
+    realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+    return [
+        'ok' => true,
+        'done' => true,
+        'cancelled' => true,
+        'job' => $job,
+        'status' => realpriceStatus(),
+        'message' => $job['message'],
+    ];
+}
+
+function realpriceIndexJobFinalize(array $job): array
+{
+    $tmp = (string) ($job['tmp_sqlite'] ?? '');
+    if ($tmp === '' || !is_file($tmp)) {
+        throw new RuntimeException('索引暫存檔遺失，請重新開始重建。');
+    }
+
+    $pdo = new PDO('sqlite:' . $tmp, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    ]);
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_records_type_date ON records(type, date)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_records_city ON records(city)');
+    $recordCount = (int) $pdo->query('SELECT COUNT(*) FROM records')->fetchColumn();
+
+    $generatedAt = date(DATE_ATOM);
+    $zipPaths = is_array($job['zip_paths'] ?? null) ? $job['zip_paths'] : [];
+    $seasonStats = is_array($job['season_stats'] ?? null) ? $job['season_stats'] : [];
+    // 僅在實際複製既有 DB 合併時，才保留其他季的狀態標記。
+    if (!empty($job['merge_existing'])) {
+        $prevMeta = realpriceLoadMeta();
+        $prevSeasons = is_array($prevMeta['indexed_seasons'] ?? null) ? $prevMeta['indexed_seasons'] : [];
+        if ($prevSeasons !== []) {
+            $merged = $prevSeasons;
+            foreach ($seasonStats as $key => $stat) {
+                if (is_array($stat)) {
+                    $merged[$key] = $stat;
+                }
+            }
+            $seasonStats = $merged;
+        }
+    }
+
+    $fileCount = 0;
+    $totalZipBytes = 0;
+    foreach ($seasonStats as $stat) {
+        if (!is_array($stat)) {
+            continue;
+        }
+        $fileCount += (int) ($stat['files'] ?? 0);
+        $totalZipBytes += (int) ($stat['size'] ?? 0);
+    }
+    if ($fileCount <= 0) {
+        $fileCount = (int) ($job['file_count'] ?? 0);
+    }
+    if ($totalZipBytes <= 0) {
+        $totalZipBytes = (int) ($job['total_zip_bytes'] ?? 0);
+    }
+
+    $indexedZipNames = array_values(array_filter(array_map(
+        static function ($stat) {
+            if (!is_array($stat)) {
+                return '';
+            }
+            return (string) ($stat['file'] ?? '');
+        },
+        $seasonStats
+    )));
+    if ($indexedZipNames === []) {
+        $indexedZipNames = array_map('basename', $zipPaths);
+    }
+
+    $metaPairs = [
+        'generated_at' => $generatedAt,
+        'source_url' => realpriceSeasonDownloadUrl((string) (realpriceRecentSeasonCodes(1)[0] ?? '115S2')),
+        'zip_paths' => $indexedZipNames,
+        'zip_size' => $totalZipBytes,
+        'file_count' => $fileCount,
+        'record_count' => $recordCount,
+        'city_map' => realpriceCityMap(),
+    ];
+    $metaInsert = $pdo->prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)');
+    foreach ($metaPairs as $key => $value) {
+        $metaInsert->execute([(string) $key, json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)]);
+    }
+    $pdo = null;
+
+    $finalPath = realpriceSqlitePath();
+    if (is_file($finalPath)) {
+        @unlink($finalPath);
+    }
+    if (!@rename($tmp, $finalPath)) {
+        if (!@copy($tmp, $finalPath)) {
+            @unlink($tmp);
+            throw new RuntimeException('實價登錄 SQLite 索引替換失敗。');
+        }
+        @unlink($tmp);
+    }
+    if (is_file(realpriceIndexPath())) {
+        @unlink(realpriceIndexPath());
+    }
+
+    $meta = realpriceLoadMeta();
+    $meta['indexed_at'] = $generatedAt;
+    $meta['indexed_count'] = $recordCount;
+    $meta['indexed_file_count'] = $fileCount;
+    $meta['indexed_zip_count'] = count($seasonStats);
+    $meta['zip_size'] = $totalZipBytes;
+    $meta['indexed_seasons'] = $seasonStats;
+    if (!empty($job['merge_existing'])) {
+        $scope = '合併勾選季度';
+    } elseif (!empty($job['selected_only'])) {
+        $scope = '勾選季度';
+    } else {
+        $scope = '全部本機 ZIP';
+    }
+    $meta['notice'] = '實價登錄索引已建立（' . $scope . '，' . count($seasonStats) . ' 個 ZIP，' . number_format($recordCount) . ' 筆，SQLite，分批）。';
+    realpriceSaveMeta($meta);
+
+    $job['status'] = 'done';
+    $job['pct'] = 100;
+    $job['record_count'] = $recordCount;
+    $job['updated_at'] = date(DATE_ATOM);
+    $job['message'] = $meta['notice'];
+    $job['current_label'] = '完成';
+    unset($job['tasks'], $job['busy'], $job['busy_until']);
+    realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+
+    return [
+        'ok' => true,
+        'done' => true,
+        'job' => $job,
+        'status' => realpriceStatus(),
+        'message' => $job['message'],
+    ];
+}
+
+function realpriceAppendCsvEntryToSqlite(
+    PDO $pdo,
+    PDOStatement $insert,
+    string $zipPath,
+    array $task,
+    int $rowOffset,
+    float $deadline,
+    int &$fileCount
+): array {
+    $entry = (string) ($task['entry'] ?? '');
+    $base = (string) ($task['base'] ?? basename($entry));
+    $cityCode = (string) ($task['city'] ?? '');
+    $type = (string) ($task['type'] ?? '');
+    if ($entry === '' || $cityCode === '' || $type === '') {
+        return ['added' => 0, 'rows_read' => 0, 'finished' => true, 'file_counted' => false];
+    }
+
+    $zip = new ZipArchive();
+    if ($zip->open($zipPath) !== true) {
+        throw new RuntimeException('實價登錄 ZIP 無法開啟：' . basename($zipPath));
+    }
+    $added = 0;
+    $rowsRead = 0;
+    $finished = true;
+    $fileCounted = false;
+    try {
+        $stream = $zip->getStream($entry);
+        if (!is_resource($stream)) {
+            return ['added' => 0, 'rows_read' => 0, 'finished' => true, 'file_counted' => false];
+        }
+        $header = fgetcsv($stream);
+        fgetcsv($stream);
+        if (!is_array($header)) {
+            fclose($stream);
+            return ['added' => 0, 'rows_read' => 0, 'finished' => true, 'file_counted' => false];
+        }
+        $header = array_map(static function ($value): string {
+            $text = trim((string) $value);
+            if (str_starts_with($text, "\xEF\xBB\xBF")) {
+                $text = substr($text, 3);
+            }
+            return $text;
+        }, $header);
+        if ($rowOffset <= 0) {
+            $fileCount++;
+            $fileCounted = true;
+        }
+        $skip = max(0, $rowOffset);
+        while (($values = fgetcsv($stream)) !== false) {
+            if ($skip > 0) {
+                $skip--;
+                continue;
+            }
+            $rowsRead++;
+            if (is_array($values) && count($values) >= 8) {
+                $row = [];
+                foreach ($header as $index => $key) {
+                    $row[(string) $key] = (string) ($values[$index] ?? '');
+                }
+                $record = realpriceRecordFromRow($row, $cityCode, $type, $base);
+                if ($record) {
+                    $sourceFile = basename($zipPath) . '::' . $base;
+                    $insert->execute([
+                        (string) $record['id'],
+                        (string) $record['type'],
+                        (string) $record['date'],
+                        (string) $record['city'],
+                        (string) $record['city_code'],
+                        (string) $record['district'],
+                        (string) $record['target'],
+                        (string) $record['address'],
+                        (string) $record['building_type'],
+                        (string) ($record['floor'] ?? ''),
+                        (string) ($record['total_floors'] ?? ''),
+                        (int) $record['total_price'],
+                        (int) $record['unit_price_sqm'],
+                        (int) $record['unit_price_ping'],
+                        (float) $record['area_sqm'],
+                        $sourceFile,
+                    ]);
+                    $added++;
+                }
+            }
+            if (microtime(true) >= $deadline) {
+                $finished = false;
+                break;
+            }
+        }
+        fclose($stream);
+    } finally {
+        $zip->close();
+    }
+    return [
+        'added' => $added,
+        'rows_read' => $rowsRead,
+        'finished' => $finished,
+        'file_counted' => $fileCounted,
+    ];
+}
+
+function realpriceIndexJobChunk(int $maxSeconds = 8): array
+{
+    @ini_set('memory_limit', '512M');
+    @set_time_limit(max(25, $maxSeconds + 15));
+
+    $job = realpriceLoadJsonFile(realpriceIndexJobStatePath(), []);
+    if (($job['status'] ?? '') !== 'running') {
+        return [
+            'ok' => true,
+            'done' => true,
+            'job' => $job,
+            'status' => realpriceStatus(),
+            'message' => (string) ($job['message'] ?? '沒有進行中的索引工作。'),
+        ];
+    }
+
+    $busyUntil = strtotime((string) ($job['busy_until'] ?? '')) ?: 0;
+    $updated = strtotime((string) ($job['updated_at'] ?? '')) ?: 0;
+    // If previous worker likely died, clear stale busy lock quickly.
+    if (!empty($job['busy']) && $busyUntil > time() && $updated > 0 && (time() - $updated) < 20) {
+        return [
+            'ok' => true,
+            'done' => false,
+            'busy' => true,
+            'job' => $job,
+            'status' => realpriceStatus(),
+            'message' => '上一小批仍在處理，稍後繼續…',
+        ];
+    }
+
+    $job['busy'] = true;
+    $job['busy_until'] = date(DATE_ATOM, time() + max(20, $maxSeconds + 12));
+    $job['updated_at'] = date(DATE_ATOM);
+    realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+
+    try {
+        $tmp = (string) ($job['tmp_sqlite'] ?? '');
+        if ($tmp === '' || !is_file($tmp)) {
+            throw new RuntimeException('索引暫存檔遺失，請重新開始重建。');
+        }
+        $zipPaths = is_array($job['zip_paths'] ?? null) ? $job['zip_paths'] : [];
+        $zipIndex = (int) ($job['zip_index'] ?? 0);
+        $zipTotal = max(1, count($zipPaths));
+        if ($zipIndex >= count($zipPaths)) {
+            $job['busy'] = false;
+            unset($job['busy_until']);
+            realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+            return realpriceIndexJobFinalize($job);
+        }
+
+        $zipPath = (string) $zipPaths[$zipIndex];
+        if (!is_file($zipPath)) {
+            throw new RuntimeException('找不到 ZIP：' . basename($zipPath));
+        }
+
+        $entries = is_array($job['current_entries'] ?? null) ? $job['current_entries'] : [];
+        $entryIndex = (int) ($job['entry_index'] ?? 0);
+        if ($entries === []) {
+            $entries = realpriceListZipCsvTasks($zipPath);
+            $entryIndex = 0;
+            $job['current_entries'] = $entries;
+            $job['entry_index'] = 0;
+            $job['entry_row'] = 0;
+            $job['zip_added'] = 0;
+            $job['zip_files'] = 0;
+            // 合併模式下重跑同一季時，先清掉該季已寫入的資料列。
+            if (!empty($job['merge_existing'])) {
+                $pdoDel = new PDO('sqlite:' . $tmp, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+                $del = $pdoDel->prepare('DELETE FROM records WHERE source_file LIKE ?');
+                $del->execute([basename($zipPath) . '::%']);
+                $removed = (int) $del->rowCount();
+                if ($removed > 0) {
+                    $job['record_count'] = max(0, (int) ($job['record_count'] ?? 0) - $removed);
+                    $job['message'] = '合併重建 ' . basename($zipPath) . '：已移除舊資料 ' . number_format($removed) . ' 筆…';
+                    $job['updated_at'] = date(DATE_ATOM);
+                    realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+                }
+                $pdoDel = null;
+            }
+        }
+
+        $pdo = new PDO('sqlite:' . $tmp, null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        ]);
+        $pdo->exec('PRAGMA journal_mode=OFF');
+        $pdo->exec('PRAGMA synchronous=OFF');
+        $insert = $pdo->prepare(
+            'INSERT OR IGNORE INTO records(
+                id, type, date, city, city_code, district, target, address,
+                building_type, floor, total_floors, total_price, unit_price_sqm, unit_price_ping, area_sqm, source_file
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        );
+
+        $started = microtime(true);
+        $deadline = $started + max(3, $maxSeconds);
+        $entryRow = (int) ($job['entry_row'] ?? 0);
+        $batchAdded = 0;
+        while ($entryIndex < count($entries) && microtime(true) < $deadline) {
+            $task = $entries[$entryIndex];
+            if (!is_array($task)) {
+                $entryIndex++;
+                $entryRow = 0;
+                continue;
+            }
+            $label = basename($zipPath) . ' / ' . (string) ($task['base'] ?? '');
+            $job['current_label'] = $label;
+            $fileCount = 0;
+            $result = realpriceAppendCsvEntryToSqlite(
+                $pdo,
+                $insert,
+                $zipPath,
+                $task,
+                $entryRow,
+                $deadline,
+                $fileCount
+            );
+            $added = (int) ($result['added'] ?? 0);
+            $rowsRead = (int) ($result['rows_read'] ?? 0);
+            $finished = !empty($result['finished']);
+            $batchAdded += $added;
+            $entryRow += $rowsRead;
+            $job['zip_added'] = (int) ($job['zip_added'] ?? 0) + $added;
+            if (!empty($result['file_counted'])) {
+                $job['zip_files'] = (int) ($job['zip_files'] ?? 0) + 1;
+                $job['file_count'] = (int) ($job['file_count'] ?? 0) + 1;
+            }
+            $job['record_count'] = (int) ($job['record_count'] ?? 0) + $added;
+            if ($finished) {
+                $entryIndex++;
+                $entryRow = 0;
+            }
+            $job['entry_index'] = $entryIndex;
+            $job['entry_row'] = $entryRow;
+            $zipPct = count($entries) > 0
+                ? (($entryIndex + ($finished ? 0 : 0.5)) / count($entries))
+                : 1;
+            $job['pct'] = (int) min(99, floor((($zipIndex + $zipPct) / $zipTotal) * 100));
+            $job['message'] = '索引中 ' . $job['pct'] . '%：' . $label
+                . '（+' . number_format($added) . '，本季 ' . number_format((int) $job['zip_added'])
+                . '，累計 ' . number_format((int) $job['record_count']) . ' 筆'
+                . ($finished ? '' : '，續跑中') . '）';
+            $job['updated_at'] = date(DATE_ATOM);
+            realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+            if (!$finished) {
+                break;
+            }
+        }
+        $pdo = null;
+
+        // Finished all CSVs in this ZIP.
+        if ($entryIndex >= count($entries)) {
+            $seasonKey = basename($zipPath);
+            $seasonStats = is_array($job['season_stats'] ?? null) ? $job['season_stats'] : [];
+            $seasonStats[$seasonKey] = [
+                'season' => strtoupper(basename($zipPath, '.zip')),
+                'file' => $seasonKey,
+                'records' => (int) ($job['zip_added'] ?? 0),
+                'files' => (int) ($job['zip_files'] ?? 0),
+                'size' => (int) filesize($zipPath),
+                'mtime_ts' => (int) (@filemtime($zipPath) ?: 0),
+                'indexed_at' => date(DATE_ATOM),
+            ];
+            $job['season_stats'] = $seasonStats;
+            $job['zip_index'] = $zipIndex + 1;
+            $job['entry_index'] = 0;
+            $job['entry_row'] = 0;
+            unset($job['current_entries'], $job['zip_added'], $job['zip_files']);
+            $job['pct'] = (int) min(99, floor(($job['zip_index'] / $zipTotal) * 100));
+            $job['message'] = '完成 ' . $seasonKey . '（累計 ' . number_format((int) $job['record_count']) . ' 筆），繼續下一季…';
+        }
+
+        $job['busy'] = false;
+        unset($job['busy_until']);
+        $job['updated_at'] = date(DATE_ATOM);
+
+        if ((int) ($job['zip_index'] ?? 0) >= count($zipPaths)) {
+            // Sync exact DB count before finalize.
+            $pdoCount = new PDO('sqlite:' . $tmp, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $job['record_count'] = (int) $pdoCount->query('SELECT COUNT(*) FROM records')->fetchColumn();
+            $pdoCount = null;
+            realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+            $result = realpriceIndexJobFinalize($job);
+            realpriceOpLog('rebuild_realprice', (string) $result['message'], [
+                'indexed_count' => (int) (($result['status']['indexed_count'] ?? 0)),
+            ], 'ok');
+            return $result;
+        }
+
+        realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+        return [
+            'ok' => true,
+            'done' => false,
+            'job' => $job,
+            'status' => realpriceStatus(),
+            'message' => $job['message'],
+        ];
+    } catch (Throwable $e) {
+        $job['status'] = 'error';
+        $job['busy'] = false;
+        unset($job['busy_until']);
+        $job['message'] = '索引失敗：' . $e->getMessage();
+        $job['updated_at'] = date(DATE_ATOM);
+        realpriceSaveJsonFile(realpriceIndexJobStatePath(), $job);
+        $tmp = (string) ($job['tmp_sqlite'] ?? '');
+        if ($tmp !== '' && is_file($tmp)) {
+            @unlink($tmp);
+        }
+        realpriceOpLog('rebuild_realprice', $job['message'], [], 'error');
+        throw $e;
+    }
 }
 
 function realpriceBoundsContains(array $bounds, float $lat, float $lng): bool

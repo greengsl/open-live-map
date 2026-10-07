@@ -63,13 +63,18 @@ function tgosHasQueryAddrCredentials(): bool
 }
 
 /**
- * Strip leading postal code / odd spaces that hurt TGOS match rate.
+ * Strip / normalize address for TGOS batch CSV.
+ * TGOS 上傳驗證是「以逗號切開必須剛好 5 欄」，不會正確處理 CSV 引號；
+ * 因此地址內不可再出現半形逗號、換行或雙引號。
  */
 function tgosCleanAddressForExport(string $address): string
 {
     $address = realpriceNormalizeAddress($address);
     $address = preg_replace('/^\d{3,5}/u', '', $address) ?? $address;
     $address = str_replace(['巿'], ['市'], $address);
+    // 半形逗號會破壞 TGOS 欄位計數；改為頓號仍可模糊比對。
+    $address = str_replace([',', '，', '"', "'", "\r", "\n", "\t"], ['、', '、', '', '', '', '', ''], $address);
+    $address = preg_replace('/\s+/u', '', $address) ?? $address;
     return trim($address);
 }
 
@@ -135,14 +140,15 @@ function tgosCollectPendingAddresses(string $cityFilter = '', int $limit = 10000
  *
  * @return array{path:string,map_path:string,count:int,filename:string,encoding:string}
  */
-function tgosBuildExport(string $cityFilter = '', int $limit = 10000, string $encoding = 'utf-8'): array
+function tgosBuildExport(string $cityFilter = '', int $limit = 10000, string $encoding = 'big5'): array
 {
     $items = tgosCollectPendingAddresses($cityFilter, $limit);
     if ($items === []) {
         throw new RuntimeException('沒有尚待精準定位的地址可匯出（或篩選縣市後為空）。請先跑完本機門牌比對，或確認索引存在。');
     }
 
-    $encoding = strtolower($encoding) === 'big5' ? 'big5' : 'utf-8';
+    // TGOS 官方／社群實務多以 Big5 上傳較穩；utf-8 仍可用但不加 BOM。
+    $encoding = strtolower($encoding) === 'utf-8' ? 'utf-8' : 'big5';
     $stamp = date('Ymd-His');
     $citySlug = $cityFilter !== '' ? preg_replace('/\W+/u', '', $cityFilter) : 'all';
     $base = 'tgos-batch-' . $citySlug . '-' . $stamp;
@@ -159,52 +165,88 @@ function tgosBuildExport(string $cityFilter = '', int $limit = 10000, string $en
         $headerBin = @iconv('UTF-8', 'BIG5//IGNORE', $header);
         fwrite($fh, $headerBin !== false ? $headerBin : $header);
     } else {
-        // UTF-8 BOM helps Excel; TGOS web upload accepts UTF-8 or Big5.
-        fwrite($fh, "\xEF\xBB\xBF" . $header);
+        // 不加 BOM：部分 TGOS 驗證會把 BOM 算進第一欄。
+        fwrite($fh, $header);
     }
 
     $map = [
         'generated_at' => date(DATE_ATOM),
         'city_filter' => $cityFilter,
         'encoding' => $encoding,
-        'count' => count($items),
+        'count' => 0,
         'items' => [],
+        'sanitized_comma_count' => 0,
     ];
 
     $id = 1000;
+    $written = 0;
+    $sanitizedComma = 0;
     foreach ($items as $item) {
-        $addr = tgosCleanAddressForExport((string) $item['address']);
-        $line = $id . ',' . tgosCsvEscape($addr) . ',,,';
+        $rawAddr = (string) $item['address'];
+        if (str_contains($rawAddr, ',') || str_contains($rawAddr, '，')) {
+            $sanitizedComma++;
+        }
+        $addr = tgosCleanAddressForExport($rawAddr);
+        if ($addr === '' || mb_strlen($addr, 'UTF-8') < 5) {
+            continue;
+        }
+        // 嚴格 5 欄、不使用 CSV 引號（TGOS 驗證不認引號）。
+        $line = $id . ',' . $addr . ',,,';
+        if (substr_count($line, ',') !== 4) {
+            // 極少數異常字元：再清一次半形逗號後重試。
+            $addr = str_replace(',', '、', $addr);
+            $line = $id . ',' . $addr . ',,,';
+            if (substr_count($line, ',') !== 4) {
+                continue;
+            }
+        }
         if ($encoding === 'big5') {
             $bin = @iconv('UTF-8', 'BIG5//IGNORE', $line . "\n");
-            fwrite($fh, $bin !== false ? $bin : ($line . "\n"));
+            if ($bin === false || $bin === "\n" || trim($bin) === '') {
+                continue;
+            }
+            fwrite($fh, $bin);
         } else {
             fwrite($fh, $line . "\n");
         }
         $map['items'][(string) $id] = [
             'key' => (string) $item['key'],
-            'address' => (string) $item['address'],
+            'address' => $rawAddr,
             'city' => (string) $item['city'],
             'district' => (string) $item['district'],
             'export_address' => $addr,
         ];
         $id++;
+        $written++;
     }
     fclose($fh);
+
+    if ($written <= 0) {
+        @unlink($csvPath);
+        throw new RuntimeException('匯出後沒有可用地址列（可能都被過濾）。請調整縣市或先完成門牌比對。');
+    }
+    $map['count'] = $written;
+    $map['sanitized_comma_count'] = $sanitizedComma;
 
     realpriceSaveJsonFile($mapPath, $map);
 
     $state = tgosLoadState();
     $state['last_export_at'] = date(DATE_ATOM);
-    $state['last_export_count'] = count($items);
-    $state['last_message'] = '已匯出 ' . count($items) . ' 筆待上傳 TGOS（' . ($cityFilter !== '' ? $cityFilter : '全部縣市') . '，' . strtoupper($encoding) . '）。';
+    $state['last_export_count'] = $written;
+    $state['last_message'] = '已匯出 ' . $written . ' 筆待上傳 TGOS（'
+        . ($cityFilter !== '' ? $cityFilter : '全部縣市')
+        . '，' . strtoupper($encoding)
+        . ($sanitizedComma > 0 ? '；已將 ' . $sanitizedComma . ' 筆地址內逗號改為頓號以免 TGOS 欄位錯誤' : '')
+        . '）。';
     $exports = is_array($state['exports'] ?? null) ? $state['exports'] : [];
     array_unshift($exports, [
         'at' => $state['last_export_at'],
-        'count' => count($items),
+        'count' => $written,
         'city' => $cityFilter,
         'file' => basename($csvPath),
         'map' => basename($mapPath),
+        'encoding' => $encoding,
+        'sanitized_comma_count' => $sanitizedComma,
     ]);
     $state['exports'] = array_slice($exports, 0, 20);
     tgosSaveState($state);
@@ -212,9 +254,10 @@ function tgosBuildExport(string $cityFilter = '', int $limit = 10000, string $en
     return [
         'path' => $csvPath,
         'map_path' => $mapPath,
-        'count' => count($items),
+        'count' => $written,
         'filename' => basename($csvPath),
         'encoding' => $encoding,
+        'sanitized_comma_count' => $sanitizedComma,
     ];
 }
 
@@ -288,7 +331,49 @@ function tgosDetectXyToLatLng(float $x, float $y): ?array
  *
  * @return array{matched:int,skipped:int,failed:int,message:string,coverage?:array}
  */
-function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
+function tgosImportJobPath(): string
+{
+    return tgosDir() . '/import-job.json';
+}
+
+function tgosImportRowsPath(): string
+{
+    return tgosDir() . '/_import-rows.json';
+}
+
+function tgosImportMapCachePath(): string
+{
+    return tgosDir() . '/_import-map.json';
+}
+
+function tgosLoadImportJob(): array
+{
+    return realpriceLoadJsonFile(tgosImportJobPath(), [
+        'status' => 'idle',
+        'offset' => 0,
+        'total' => 0,
+        'matched' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'original_name' => '',
+        'message' => '',
+        'started_at' => '',
+        'updated_at' => '',
+    ]);
+}
+
+function tgosSaveImportJob(array $job): void
+{
+    $job['updated_at'] = date(DATE_ATOM);
+    realpriceSaveJsonFile(tgosImportJobPath(), $job);
+}
+
+/**
+ * Parse TGOS result CSV into normalized rows (only rows with numeric X/Y).
+ *
+ * @return array{rows: list<array<string,mixed>>, original_name: string}
+ */
+function tgosParseResultUpload(string $tmpPath, string $originalName = ''): array
 {
     if ($tmpPath === '' || !is_file($tmpPath)) {
         throw new RuntimeException('找不到上傳的結果檔。');
@@ -308,7 +393,6 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
             $rawUtf = $converted;
         }
     } elseif (!preg_match('/Address|Response_|地址|門牌/u', substr($raw, 0, 800))) {
-        // Header looks garbled under UTF-8 — try Big5.
         $converted = @iconv('BIG5', 'UTF-8//IGNORE', $raw);
         if (is_string($converted) && preg_match('/Address|Response_|地址|門牌/u', substr($converted, 0, 800))) {
             $rawUtf = $converted;
@@ -320,12 +404,14 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
 
     $fh = fopen($tmpUtf, 'rb');
     if ($fh === false) {
+        @unlink($tmpUtf);
         throw new RuntimeException('無法讀取結果檔。');
     }
 
     $header = fgetcsv($fh);
     if (!is_array($header) || $header === []) {
         fclose($fh);
+        @unlink($tmpUtf);
         throw new RuntimeException('結果檔缺少表頭。預期欄位：id, Address, Response_Address, Response_X, Response_Y');
     }
     $norm = [];
@@ -342,10 +428,10 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
 
     if ($colX < 0 || $colY < 0) {
         fclose($fh);
+        @unlink($tmpUtf);
         throw new RuntimeException('結果檔找不到坐標欄（Response_X / Response_Y 或經緯度）。');
     }
 
-    $previewIds = [];
     $rows = [];
     while (($row = fgetcsv($fh)) !== false) {
         if (!is_array($row) || $row === []) {
@@ -358,9 +444,6 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
         $yRaw = trim((string) ($row[$colY] ?? ''));
         if ($xRaw === '' || $yRaw === '' || !is_numeric($xRaw) || !is_numeric($yRaw)) {
             continue;
-        }
-        if ($id !== '') {
-            $previewIds[] = $id;
         }
         $rows[] = [
             'id' => $id,
@@ -377,24 +460,100 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
         throw new RuntimeException('結果檔沒有可匯入的坐標列（可能全部比對失敗）。');
     }
 
+    return [
+        'rows' => $rows,
+        'original_name' => $originalName !== '' ? $originalName : basename($tmpPath),
+    ];
+}
+
+function tgosImportJobStart(string $tmpPath, string $originalName = ''): array
+{
+    @set_time_limit(120);
+    $parsed = tgosParseResultUpload($tmpPath, $originalName);
+    $rows = $parsed['rows'];
+    $name = (string) $parsed['original_name'];
+
+    $previewIds = [];
+    foreach ($rows as $row) {
+        $id = trim((string) ($row['id'] ?? ''));
+        if ($id !== '') {
+            $previewIds[] = $id;
+            if (count($previewIds) >= 200) {
+                break;
+            }
+        }
+    }
     $map = tgosFindMapForIds($previewIds);
     $mapItems = is_array($map['items'] ?? null) ? $map['items'] : [];
+    realpriceSaveJsonFile(tgosImportMapCachePath(), ['items' => $mapItems]);
+    realpriceSaveJsonFile(tgosImportRowsPath(), ['rows' => $rows]);
 
-    $cache = realpriceLoadGeocodeCache();
-    $cached = is_array($cache['items'] ?? null) ? $cache['items'] : [];
+    $job = [
+        'status' => 'running',
+        'offset' => 0,
+        'total' => count($rows),
+        'matched' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'original_name' => $name,
+        'message' => '已解析 ' . number_format(count($rows)) . ' 筆有效坐標，開始分批寫入…',
+        'started_at' => date(DATE_ATOM),
+        'pct' => 0,
+    ];
+    tgosSaveImportJob($job);
+    return $job;
+}
+
+function tgosImportJobChunk(int $limit = 300): array
+{
+    @set_time_limit(60);
+    @ini_set('memory_limit', '512M');
+    $limit = max(50, min(800, $limit));
+    $job = tgosLoadImportJob();
+    if (($job['status'] ?? '') !== 'running') {
+        return [
+            'job' => $job,
+            'done' => true,
+            'message' => (string) ($job['message'] ?? '目前沒有進行中的 TGOS 匯入。'),
+        ];
+    }
+
+    $rowsFile = realpriceLoadJsonFile(tgosImportRowsPath(), []);
+    $rows = is_array($rowsFile['rows'] ?? null) ? $rowsFile['rows'] : [];
+    $total = count($rows);
+    if ($total === 0) {
+        $job['status'] = 'error';
+        $job['message'] = '匯入暫存列檔遺失，請重新上傳。';
+        tgosSaveImportJob($job);
+        return ['job' => $job, 'done' => true, 'message' => $job['message']];
+    }
+
+    $mapFile = realpriceLoadJsonFile(tgosImportMapCachePath(), []);
+    $mapItems = is_array($mapFile['items'] ?? null) ? $mapFile['items'] : [];
+    $offset = max(0, (int) ($job['offset'] ?? 0));
+    $slice = array_slice($rows, $offset, $limit);
+
+    // 只寫入輕量 overlay／delta，不每批重寫 20MB+ 的 geocode-cache.json（Synology 易 504／空回應）。
+    $overlay = realpriceLoadGeocodeTgosOverlay();
+    $deltaItems = is_array($overlay['items'] ?? null) ? $overlay['items'] : [];
     $matched = 0;
     $skipped = 0;
     $failed = 0;
+    $originalName = (string) ($job['original_name'] ?? '');
 
-    foreach ($rows as $row) {
-        $ll = tgosDetectXyToLatLng((float) $row['x'], (float) $row['y']);
+    foreach ($slice as $row) {
+        if (!is_array($row)) {
+            $failed++;
+            continue;
+        }
+        $ll = tgosDetectXyToLatLng((float) ($row['x'] ?? 0), (float) ($row['y'] ?? 0));
         if ($ll === null) {
             $failed++;
             continue;
         }
 
         $meta = null;
-        $id = (string) $row['id'];
+        $id = (string) ($row['id'] ?? '');
         if ($id !== '' && isset($mapItems[$id]) && is_array($mapItems[$id])) {
             $meta = $mapItems[$id];
         }
@@ -410,7 +569,7 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
             $key = (string) ($meta['key'] ?? '');
         }
         if ($address === '') {
-            $address = realpriceNormalizeAddress((string) ($row['address'] !== '' ? $row['address'] : $row['response']));
+            $address = realpriceNormalizeAddress((string) (($row['address'] ?? '') !== '' ? $row['address'] : ($row['response'] ?? '')));
         }
         if ($address === '') {
             $failed++;
@@ -420,63 +579,113 @@ function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
             $key = realpriceGeocodeKey($address);
         }
 
-        $existing = is_array($cached[$key] ?? null) ? $cached[$key] : null;
-        if ($existing
-            && (($existing['provider'] ?? '') === 'doorplate_opendata' || ($existing['provider'] ?? '') === 'local_override')
-            && !realpriceGeocodeHitIsDistrictFallback($existing, $city, $district)
-            && (($existing['precision'] ?? '') !== 'district')
-        ) {
-            $skipped++;
-            continue;
-        }
-
-        $cached[$key] = [
+        $deltaItems[$key] = [
             'address' => $address,
             'city' => $city,
             'district' => $district,
             'lat' => (float) $ll['lat'],
             'lng' => (float) $ll['lng'],
-            'display_name' => (string) ($row['response'] !== '' ? $row['response'] : $address),
+            'display_name' => (string) (($row['response'] ?? '') !== '' ? $row['response'] : $address),
             'provider' => 'tgos',
             'precision' => 'address',
-            'query' => (string) ($row['address'] !== '' ? $row['address'] : $address),
+            'query' => (string) (($row['address'] ?? '') !== '' ? $row['address'] : $address),
             'srs' => (string) ($ll['srs'] ?? ''),
-            'source_file' => $originalName !== '' ? $originalName : basename($tmpPath),
+            'source_file' => $originalName,
             'updated_at' => date(DATE_ATOM),
         ];
         $matched++;
     }
 
-    $cache['items'] = $cached;
-    $cache['updated_at'] = date(DATE_ATOM);
-    realpriceSaveJsonFile(realpriceGeocodeCachePath(), $cache);
+    $overlay['items'] = $deltaItems;
+    realpriceSaveGeocodeTgosOverlay($overlay);
 
-    $message = 'TGOS 結果已匯入：寫入 ' . number_format($matched) . ' 筆'
-        . ($skipped > 0 ? '，略過已有本機／手動座標 ' . number_format($skipped) . ' 筆' : '')
-        . ($failed > 0 ? '，無法解析 ' . number_format($failed) . ' 筆' : '')
-        . '。';
+    $offset += count($slice);
+    $job['offset'] = $offset;
+    $job['matched'] = (int) ($job['matched'] ?? 0) + $matched;
+    $job['skipped'] = (int) ($job['skipped'] ?? 0) + $skipped;
+    $job['failed'] = (int) ($job['failed'] ?? 0) + $failed;
+    $job['total'] = $total;
+    $job['pct'] = $total > 0 ? round(($offset / $total) * 100, 1) : 100;
+    $done = $offset >= $total;
 
-    $state = tgosLoadState();
-    $state['last_import_at'] = date(DATE_ATOM);
-    $state['last_import_matched'] = $matched;
-    $state['last_message'] = $message;
-    tgosSaveState($state);
+    if ($done) {
+        $message = 'TGOS 結果已匯入：寫入 ' . number_format((int) $job['matched']) . ' 筆'
+            . ((int) $job['skipped'] > 0 ? '，略過 ' . number_format((int) $job['skipped']) . ' 筆' : '')
+            . ((int) $job['failed'] > 0 ? '，無法解析 ' . number_format((int) $job['failed']) . ' 筆' : '')
+            . '（已寫入 TGOS 增量快取）。';
+        $job['status'] = 'done';
+        $job['message'] = $message;
+        $job['pct'] = 100;
 
-    realpriceOpLog('tgos_import', $message, [
-        'matched' => $matched,
-        'skipped' => $skipped,
-        'failed' => $failed,
-        'file' => $originalName,
-    ], 'ok');
+        $state = tgosLoadState();
+        $state['last_import_at'] = date(DATE_ATOM);
+        $state['last_import_matched'] = (int) $job['matched'];
+        $state['last_message'] = $message;
+        tgosSaveState($state);
 
-    $coverage = realpriceCoverageStats(true);
+        realpriceOpLog('tgos_import', $message, [
+            'matched' => (int) $job['matched'],
+            'skipped' => (int) $job['skipped'],
+            'failed' => (int) $job['failed'],
+            'file' => $originalName,
+            'overlay' => basename(realpriceGeocodeTgosOverlayPath()),
+        ], 'ok');
+
+        @unlink(tgosImportRowsPath());
+        @unlink(tgosImportMapCachePath());
+    } else {
+        $job['message'] = '匯入中 ' . number_format($offset) . ' / ' . number_format($total)
+            . '（本批寫入 ' . number_format($matched) . '）…';
+    }
+    tgosSaveImportJob($job);
 
     return [
-        'matched' => $matched,
-        'skipped' => $skipped,
-        'failed' => $failed,
-        'message' => $message,
-        'coverage' => $coverage,
+        'job' => $job,
+        'done' => $done,
+        'chunk' => [
+            'matched' => $matched,
+            'skipped' => $skipped,
+            'failed' => $failed,
+            'offset' => $offset,
+            'total' => $total,
+            'pct' => (float) ($job['pct'] ?? 0),
+        ],
+        'message' => (string) $job['message'],
+        'state' => $done ? tgosLoadState() : null,
+    ];
+}
+
+function tgosImportJobCancel(): array
+{
+    $job = tgosLoadImportJob();
+    $job['status'] = 'cancelled';
+    $job['message'] = '已取消 TGOS 匯入（已寫入的座標會保留）。';
+    tgosSaveImportJob($job);
+    @unlink(tgosImportRowsPath());
+    @unlink(tgosImportMapCachePath());
+    return $job;
+}
+
+/** @deprecated Prefer chunked import_tgos_job_* for large files. */
+function tgosImportResultFile(string $tmpPath, string $originalName = ''): array
+{
+    $job = tgosImportJobStart($tmpPath, $originalName);
+    $guard = 0;
+    $last = ['job' => $job, 'done' => false, 'message' => ''];
+    while ($guard < 500) {
+        $guard++;
+        $last = tgosImportJobChunk(800);
+        if (!empty($last['done'])) {
+            break;
+        }
+    }
+    $job = is_array($last['job'] ?? null) ? $last['job'] : $job;
+    return [
+        'matched' => (int) ($job['matched'] ?? 0),
+        'skipped' => (int) ($job['skipped'] ?? 0),
+        'failed' => (int) ($job['failed'] ?? 0),
+        'rows_with_xy' => (int) ($job['total'] ?? 0),
+        'message' => (string) ($job['message'] ?? $last['message'] ?? ''),
     ];
 }
 
@@ -505,7 +714,10 @@ function tgosQueryAddr(string $address): array
         throw new RuntimeException('尚未設定 tgos_app_id / tgos_api_key（此為「全國門牌定位」即時 API，與批次上傳金鑰不同）。');
     }
 
-    $address = tgosCleanAddressForExport($address);
+    $address = realpriceNormalizeAddress($address);
+    $address = preg_replace('/^\d{3,5}/u', '', $address) ?? $address;
+    $address = str_replace(['巿'], ['市'], $address);
+    $address = trim($address);
     $params = http_build_query([
         'oAPPId' => $appId,
         'oAPIKey' => $apiKey,

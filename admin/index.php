@@ -140,7 +140,7 @@ if ($postAction !== '') {
     $activeTab = match ($postAction) {
         'save' => 'sources',
         'save_monetization' => 'monetization',
-        'download_realprice', 'check_realprice', 'rebuild_realprice', 'prepare_realprice_geocode', 'process_realprice_geocode', 'repair_realprice_geocode', 'refresh_realprice_coverage', 'clear_realprice_oplog', 'download_doorplate', 'match_doorplate', 'match_doorplate_start', 'match_doorplate_chunk', 'match_doorplate_cancel', 'match_doorplate_status', 'upload_doorplate', 'register_doorplate', 'export_tgos_batch', 'import_tgos_batch', 'save_realprice_override', 'save_realprice_custom' => 'realprice',
+        'download_realprice', 'check_realprice', 'rebuild_realprice', 'rebuild_realprice_start', 'rebuild_realprice_chunk', 'rebuild_realprice_cancel', 'rebuild_realprice_status', 'prepare_realprice_geocode', 'process_realprice_geocode', 'repair_realprice_geocode', 'refresh_realprice_coverage', 'refresh_realprice_coverage_chunk', 'refresh_realprice_coverage_cancel', 'clear_realprice_oplog', 'download_doorplate', 'match_doorplate', 'match_doorplate_start', 'match_doorplate_chunk', 'match_doorplate_cancel', 'match_doorplate_status', 'upload_doorplate', 'register_doorplate', 'export_tgos_batch', 'import_tgos_batch', 'import_tgos_chunk', 'import_tgos_cancel', 'save_realprice_override', 'save_realprice_custom' => 'realprice',
         'save_ui', 'save_mapillary' => 'appearance',
         'update_cctv_report', 'save_cctv_report_types' => 'reports',
         'approve_cctv_submission', 'reject_cctv_submission' => 'submissions',
@@ -148,10 +148,10 @@ if ($postAction !== '') {
         default => $activeTab,
     };
     $realpriceSub = match ($postAction) {
-        'download_realprice', 'check_realprice', 'rebuild_realprice' => 'data',
-        'refresh_realprice_coverage' => 'coverage',
+        'download_realprice', 'check_realprice', 'rebuild_realprice', 'rebuild_realprice_start', 'rebuild_realprice_chunk', 'rebuild_realprice_cancel', 'rebuild_realprice_status' => 'data',
+        'refresh_realprice_coverage', 'refresh_realprice_coverage_chunk', 'refresh_realprice_coverage_cancel' => 'coverage',
         'download_doorplate', 'match_doorplate', 'match_doorplate_start', 'match_doorplate_chunk', 'match_doorplate_cancel', 'match_doorplate_status', 'upload_doorplate', 'register_doorplate' => 'doorplate',
-        'export_tgos_batch', 'import_tgos_batch' => 'tgos',
+        'export_tgos_batch', 'import_tgos_batch', 'import_tgos_chunk', 'import_tgos_cancel' => 'tgos',
         'prepare_realprice_geocode', 'process_realprice_geocode', 'repair_realprice_geocode' => 'geocode',
         'save_realprice_override', 'save_realprice_custom' => 'records',
         'clear_realprice_oplog' => 'log',
@@ -292,12 +292,10 @@ if ($authenticated && ($_POST['action'] ?? '') === 'save_mapillary') {
 if ($authenticated && ($_POST['action'] ?? '') === 'download_realprice') {
     try {
         $realpriceStatus = realpriceDownloadRecentSeasons(5);
-        $message = '已下載近 5 季實價登錄並重建索引：'
-            . number_format((int) ($realpriceStatus['indexed_count'] ?? 0)) . ' 筆'
-            . '（季度 ZIP ' . number_format((int) ($realpriceStatus['season_zip_count'] ?? 0)) . ' 個）。'
-            . ' 先前若只有「本期」小檔會顯得資料很少，這次改抓完整季度批次。';
+        $message = '已下載近 5 季實價登錄 ZIP：'
+            . number_format((int) ($realpriceStatus['season_zip_count'] ?? 0)) . ' 個季度檔可用。'
+            . '請按「用本機季度 ZIP 重建索引」分批建立索引（避免 504）。';
         realpriceOpLog('download_realprice', $message, [
-            'indexed_count' => (int) ($realpriceStatus['indexed_count'] ?? 0),
             'season_zip_count' => (int) ($realpriceStatus['season_zip_count'] ?? 0),
         ], 'ok');
         $saved = true;
@@ -322,17 +320,84 @@ if ($authenticated && ($_POST['action'] ?? '') === 'check_realprice') {
 }
 
 if ($authenticated && ($_POST['action'] ?? '') === 'rebuild_realprice') {
+    $error = '為避免 Cloudflare／Synology 504，請使用「用本機季度 ZIP 重建索引」按鈕（分批 AJAX，會顯示進度），不要用整頁送出。';
+    if (adminWantsJson()) {
+        adminJson(['ok' => false, 'message' => $error], 422);
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'rebuild_realprice_start') {
     try {
-        $realpriceStatus = realpriceBuildIndex();
-        $message = '實價登錄索引已重建：' . number_format((int) $realpriceStatus['indexed_count']) . ' 筆。';
-        realpriceOpLog('rebuild_realprice', $message, [
-            'indexed_count' => (int) ($realpriceStatus['indexed_count'] ?? 0),
+        $selected = $_POST['seasons'] ?? [];
+        if (!is_array($selected)) {
+            $selected = [];
+        }
+        $result = realpriceIndexJobStart($selected);
+        $message = (string) ($result['message'] ?? '已開始分批重建索引。');
+        realpriceOpLog('rebuild_realprice_start', $message, [
+            'zip_count' => (int) (($result['job']['zip_count'] ?? 0)),
+            'selected' => array_values(array_map('strval', $selected)),
         ], 'ok');
+        if (adminWantsJson()) {
+            adminJson($result);
+        }
+        $realpriceStatus = realpriceStatus();
         $saved = true;
     } catch (Throwable $e) {
         $error = $e->getMessage();
-        realpriceOpLog('rebuild_realprice', $error, [], 'error');
+        realpriceOpLog('rebuild_realprice_start', $error, [], 'error');
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error], 422);
+        }
     }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'rebuild_realprice_chunk') {
+    try {
+        $result = realpriceIndexJobChunk(10);
+        if (adminWantsJson()) {
+            adminJson($result);
+        }
+        $realpriceStatus = $result['status'] ?? realpriceStatus();
+        $message = (string) ($result['message'] ?? '索引批次已處理。');
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'rebuild_realprice_cancel') {
+    try {
+        $result = realpriceIndexJobCancel();
+        $message = (string) ($result['message'] ?? '已取消索引重建。');
+        realpriceOpLog('rebuild_realprice_cancel', $message, [], 'warn');
+        if (adminWantsJson()) {
+            adminJson($result);
+        }
+        $realpriceStatus = realpriceStatus();
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'rebuild_realprice_status') {
+    $job = realpriceLoadJsonFile(realpriceIndexJobStatePath(), []);
+    $status = (string) ($job['status'] ?? '');
+    adminJson([
+        'ok' => true,
+        'done' => !in_array($status, ['running'], true),
+        'cancelled' => $status === 'cancelled',
+        'job' => $job,
+        'message' => (string) ($job['message'] ?? ''),
+        'status' => realpriceStatus(),
+    ]);
 }
 
 if ($authenticated && ($_POST['action'] ?? '') === 'prepare_realprice_geocode') {
@@ -386,19 +451,84 @@ if ($authenticated && ($_POST['action'] ?? '') === 'repair_realprice_geocode') {
 
 if ($authenticated && ($_POST['action'] ?? '') === 'refresh_realprice_coverage') {
     try {
-        $realpriceCoverage = realpriceCoverageStats(true);
-        $message = (string) ($realpriceCoverage['message'] ?? '定位覆蓋統計已更新。');
+        $job = realpriceCoverageJobStart();
+        $message = (string) ($job['message'] ?? '已開始分批統計覆蓋。');
         realpriceOpLog('refresh_coverage', $message, [
-            'precise_count' => (int) ($realpriceCoverage['precise_count'] ?? 0),
-            'need_match_count' => (int) ($realpriceCoverage['need_match_count'] ?? 0),
+            'total_rows' => (int) ($job['total_rows'] ?? 0),
         ], 'ok');
         if (adminWantsJson()) {
-            adminJson(['ok' => true, 'message' => $message, 'coverage' => $realpriceCoverage]);
+            adminJson([
+                'ok' => true,
+                'message' => $message,
+                'need_chunk' => true,
+                'done' => false,
+                'job' => $job,
+            ]);
+        }
+        // Non-AJAX fallback: run a few chunks then show progress message.
+        $guard = 0;
+        $last = ['done' => false, 'message' => $message, 'job' => $job, 'coverage' => null];
+        while ($guard < 20 && empty($last['done'])) {
+            $guard++;
+            $last = realpriceCoverageJobChunk(10000);
+        }
+        $message = (string) ($last['message'] ?? $message);
+        if (is_array($last['coverage'] ?? null)) {
+            $realpriceCoverage = $last['coverage'];
         }
         $saved = true;
     } catch (Throwable $e) {
         $error = $e->getMessage();
         realpriceOpLog('refresh_coverage', $error, [], 'error');
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'refresh_realprice_coverage_chunk') {
+    try {
+        $result = realpriceCoverageJobChunk((int) ($_POST['budget_ms'] ?? 12000));
+        if (adminWantsJson()) {
+            $payload = [
+                'ok' => true,
+                'message' => (string) ($result['message'] ?? ''),
+                'done' => !empty($result['done']),
+                'job' => $result['job'] ?? realpriceLoadCoverageJob(),
+                'chunk' => $result['chunk'] ?? null,
+            ];
+            if (is_array($result['coverage'] ?? null)) {
+                $payload['coverage'] = $result['coverage'];
+                realpriceOpLog('refresh_coverage', (string) $payload['message'], [
+                    'precise_count' => (int) ($result['coverage']['precise_count'] ?? 0),
+                    'need_match_count' => (int) ($result['coverage']['need_match_count'] ?? 0),
+                ], 'ok');
+            }
+            adminJson($payload);
+        }
+        $message = (string) ($result['message'] ?? '');
+        if (is_array($result['coverage'] ?? null)) {
+            $realpriceCoverage = $result['coverage'];
+        }
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error, 'job' => realpriceLoadCoverageJob()], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'refresh_realprice_coverage_cancel') {
+    try {
+        $job = realpriceCoverageJobCancel();
+        if (adminWantsJson()) {
+            adminJson(['ok' => true, 'message' => (string) ($job['message'] ?? '已取消'), 'job' => $job]);
+        }
+        $message = (string) ($job['message'] ?? '已取消');
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
         if (adminWantsJson()) {
             adminJson(['ok' => false, 'message' => $error], 422);
         }
@@ -577,16 +707,54 @@ if ($authenticated && ($_POST['action'] ?? '') === 'export_tgos_batch') {
         $limit = (int) ($_POST['tgos_limit'] ?? 10000);
         $encoding = (string) ($_POST['tgos_encoding'] ?? 'utf-8');
         $built = tgosBuildExport($cityFilter, $limit, $encoding);
-        realpriceOpLog('tgos_export', (string) (tgosLoadState()['last_message'] ?? '已匯出 TGOS 批次'), [
+        $exportMessage = (string) (tgosLoadState()['last_message'] ?? '已匯出 TGOS 批次');
+        realpriceOpLog('tgos_export', $exportMessage, [
             'count' => (int) ($built['count'] ?? 0),
             'city' => $cityFilter,
             'encoding' => (string) ($built['encoding'] ?? ''),
         ], 'ok');
+        if (adminWantsJson()) {
+            adminJson([
+                'ok' => true,
+                'message' => $exportMessage,
+                'filename' => (string) ($built['filename'] ?? ''),
+                'count' => (int) ($built['count'] ?? 0),
+                'download' => 'index.php?tab=realprice&rp=tgos&tgos_dl=' . rawurlencode((string) ($built['filename'] ?? '')),
+                'state' => tgosLoadState(),
+            ]);
+        }
         tgosDownloadExport($built);
     } catch (Throwable $e) {
         $error = $e->getMessage();
         $tgosState = tgosLoadState();
         realpriceOpLog('tgos_export', $error, [], 'error');
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error, 'state' => $tgosState], 422);
+        }
+    }
+}
+
+if ($authenticated && isset($_GET['tgos_dl']) && $activeTab === 'realprice') {
+    try {
+        $file = basename((string) $_GET['tgos_dl']);
+        if ($file === '' || !preg_match('/^tgos-batch-.+\.csv$/i', $file)) {
+            throw new RuntimeException('無效的匯出檔名。');
+        }
+        $path = tgosDir() . '/' . $file;
+        if (!is_file($path)) {
+            throw new RuntimeException('找不到匯出檔，請重新匯出。');
+        }
+        $mapPath = preg_replace('/\.csv$/i', '.map.json', $path) ?: ($path . '.map.json');
+        $map = is_file($mapPath) ? realpriceLoadJsonFile($mapPath, []) : [];
+        $encoding = strtolower((string) ($map['encoding'] ?? 'utf-8')) === 'big5' ? 'big5' : 'utf-8';
+        tgosDownloadExport([
+            'path' => $path,
+            'filename' => $file,
+            'encoding' => $encoding,
+        ]);
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        $tgosState = tgosLoadState();
     }
 }
 
@@ -598,16 +766,77 @@ if ($authenticated && ($_POST['action'] ?? '') === 'import_tgos_batch') {
         }
         $tmp = (string) ($file['tmp_name'] ?? '');
         $name = (string) ($file['name'] ?? 'tgos-result.csv');
-        $result = tgosImportResultFile($tmp, $name);
-        $message = (string) ($result['message'] ?? 'TGOS 結果已匯入。');
+        $job = tgosImportJobStart($tmp, $name);
+        $message = (string) ($job['message'] ?? '已開始分批匯入 TGOS 結果。');
         $saved = true;
         $tgosState = tgosLoadState();
-        $realpriceCoverage = is_array($result['coverage'] ?? null) ? $result['coverage'] : realpriceCoverageStats(true);
-        $realpriceGeocodeStats = realpriceGeocodeStats();
+        if (adminWantsJson()) {
+            adminJson([
+                'ok' => true,
+                'message' => $message,
+                'need_chunk' => true,
+                'job' => $job,
+                'state' => $tgosState,
+            ]);
+        }
+        // Non-AJAX fallback: process a few chunks then ask to continue via UI.
+        $guard = 0;
+        $last = ['done' => false, 'message' => $message, 'job' => $job];
+        while ($guard < 40 && empty($last['done'])) {
+            $guard++;
+            $last = tgosImportJobChunk(500);
+        }
+        $message = (string) ($last['message'] ?? $message);
+        $tgosState = tgosLoadState();
     } catch (Throwable $e) {
         $error = $e->getMessage();
         $tgosState = tgosLoadState();
         realpriceOpLog('tgos_import', $error, [], 'error');
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error, 'state' => $tgosState], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'import_tgos_chunk') {
+    try {
+        $result = tgosImportJobChunk((int) ($_POST['limit'] ?? 300));
+        $tgosState = tgosLoadState();
+        if (adminWantsJson()) {
+            adminJson([
+                'ok' => true,
+                'message' => (string) ($result['message'] ?? ''),
+                'done' => !empty($result['done']),
+                'job' => $result['job'] ?? tgosLoadImportJob(),
+                'chunk' => $result['chunk'] ?? null,
+                'state' => $tgosState,
+            ]);
+        }
+        $message = (string) ($result['message'] ?? '');
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        $tgosState = tgosLoadState();
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error, 'state' => $tgosState, 'job' => tgosLoadImportJob()], 422);
+        }
+    }
+}
+
+if ($authenticated && ($_POST['action'] ?? '') === 'import_tgos_cancel') {
+    try {
+        $job = tgosImportJobCancel();
+        $tgosState = tgosLoadState();
+        if (adminWantsJson()) {
+            adminJson(['ok' => true, 'message' => (string) ($job['message'] ?? '已取消'), 'job' => $job, 'state' => $tgosState]);
+        }
+        $message = (string) ($job['message'] ?? '已取消');
+        $saved = true;
+    } catch (Throwable $e) {
+        $error = $e->getMessage();
+        if (adminWantsJson()) {
+            adminJson(['ok' => false, 'message' => $error], 422);
+        }
     }
 }
 
@@ -1322,43 +1551,77 @@ function searchTextLower(string $value): string
             </div>
             <?php if ($localSeasons !== []): ?>
                 <div class="analytics-table-wrap mt-tight">
-                    <table>
+                    <table id="realpriceSeasonTable">
                         <thead>
                             <tr>
+                                <th><input type="checkbox" id="realpriceSeasonCheckAll" checked title="全選／取消"></th>
                                 <th>季度</th>
                                 <th>檔名</th>
                                 <th>大小</th>
                                 <th>檔案時間</th>
+                                <th>索引狀態</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php foreach ($localSeasons as $seasonRow): ?>
+                                <?php
+                                $st = (string) ($seasonRow['index_status'] ?? 'pending');
+                                $stLabel = match ($st) {
+                                    'ok' => '已索引',
+                                    'stale' => '需更新',
+                                    'empty' => '0 筆',
+                                    default => '未索引',
+                                };
+                                ?>
                                 <tr>
+                                    <td>
+                                        <input type="checkbox" class="realprice-season-check" value="<?= h((string) ($seasonRow['file'] ?? '')) ?>" checked>
+                                    </td>
                                     <td><?= h((string) ($seasonRow['season'] ?? '')) ?></td>
                                     <td><code><?= h((string) ($seasonRow['file'] ?? '')) ?></code></td>
                                     <td><?= h(realpriceHumanSize((int) ($seasonRow['size'] ?? 0))) ?></td>
                                     <td><?= h((string) ($seasonRow['mtime'] ?? '')) ?></td>
+                                    <td>
+                                        <span class="season-index-status is-<?= h($st) ?>"><?= h($stLabel) ?></span>
+                                        <small class="muted"> <?= h((string) ($seasonRow['index_note'] ?? '')) ?></small>
+                                    </td>
                                 </tr>
                             <?php endforeach; ?>
                         </tbody>
                     </table>
                 </div>
+                <p class="muted">勾選要納入的季度後再重建。<strong>勾選部分季度會合併進既有索引</strong>（已完成的季會保留）。若要從頭重做全部，請用「全部季度重建」。</p>
             <?php else: ?>
                 <p class="muted">目前 <code>seasons/</code> 目錄尚無有效 ZIP。可從官方下載，或手動複製 <code>YYYYsN.zip</code> 進去。</p>
             <?php endif; ?>
-            <form method="post" class="actions mt-tight">
-                <input type="hidden" name="action" value="rebuild_realprice">
-                <button class="primary" type="submit"<?= $canRebuildFromLocal ? '' : ' disabled' ?>>用本機季度 ZIP 重建索引</button>
-            </form>
-            <p class="muted">季數多時重建可能要幾分鐘；完成後索引筆數會更新。門牌比對請另跑「本機門牌比對」。</p>
+            <?php
+            $indexJob = realpriceLoadJsonFile(realpriceIndexJobStatePath(), []);
+            $indexJobRunning = (($indexJob['status'] ?? '') === 'running');
+            ?>
+            <div class="doorplate-upload-progress" id="realpriceIndexProgress"<?= $indexJobRunning ? '' : ' hidden' ?>>
+                <div class="doorplate-upload-bar"><span id="realpriceIndexBar" style="width:<?= (int) ($indexJob['pct'] ?? 0) ?>%"></span></div>
+                <p class="muted" id="realpriceIndexStatusText"><?= h((string) ($indexJob['message'] ?? '準備重建索引…')) ?></p>
+            </div>
+            <div class="actions mt-tight">
+                <button class="primary" type="button" id="realpriceIndexBtn"<?= $canRebuildFromLocal ? '' : ' disabled' ?>>重建勾選季度索引</button>
+                <button class="button" type="button" id="realpriceIndexAllBtn"<?= $canRebuildFromLocal ? '' : ' disabled' ?>>全部季度重建</button>
+                <button class="button" type="button" id="realpriceIndexCancelBtn"<?= $indexJobRunning ? '' : ' hidden' ?>>取消重建</button>
+            </div>
+            <p class="muted">會<strong>逐季 AJAX</strong>重建並顯示進度，避免 Cloudflare／Synology 504。完成後各季狀態與總筆數會更新。</p>
         </section>
-        <form class="card compact-card" method="post">
+        <form class="card compact-card js-busy-submit" method="post"
+              data-busy-label="下載中…"
+              data-busy-status="正在下載近 5 季 ZIP，檔案較大請耐心等候…">
             <input type="hidden" name="action" value="download_realprice">
             <p>
-                也可由後台自動下載內政部<strong>近 5 個季度</strong>並重建索引（會覆寫同名季檔）。手動已放好的較舊季不會被刪掉。
+                也可由後台自動下載內政部<strong>近 5 個季度</strong>（會覆寫同名季檔）。下載完成後請再按上方「重建索引」分批建立，避免 504。手動已放好的較舊季不會被刪掉。
             </p>
+            <div class="doorplate-upload-progress form-busy-progress" hidden>
+                <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                <p class="muted form-busy-status" aria-live="polite">準備下載…</p>
+            </div>
             <div class="actions">
-                <button class="button" type="submit">下載近 5 季並重建索引</button>
+                <button class="button" type="submit">下載近 5 季 ZIP</button>
                 <a class="button" href="https://plvr.land.moi.gov.tw/DownloadOpenData" target="_blank" rel="noopener">開啟官方開放資料</a>
             </div>
         </form>
@@ -1455,13 +1718,20 @@ function searchTextLower(string $value): string
                     </tbody>
                 </table>
             </div>
-            <form method="post" class="actions mt-tight js-busy-submit" data-busy-label="統計中…" data-busy-status="正在重新統計覆蓋，請稍候…">
+            <form method="post" class="actions mt-tight js-busy-submit" id="coverageRefreshForm"
+                  data-busy-label="統計中…"
+                  data-busy-status="正在分批統計覆蓋，請稍候…"
+                  data-busy-mode="coverage-refresh">
                 <input type="hidden" name="action" value="refresh_realprice_coverage">
+                <div class="doorplate-upload-progress form-busy-progress" hidden>
+                    <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                    <p class="muted form-busy-status" aria-live="polite">準備統計…</p>
+                </div>
                 <button class="button" type="submit">重新統計覆蓋</button>
-                <span class="form-busy-status" aria-live="polite" hidden></span>
+                <button class="button ghost" type="button" id="coverageRefreshCancelBtn" hidden>取消</button>
             </form>
             <p class="muted">
-                快速看圖：地圖縮放後，有門牌點＝已精準；只有虛線行政區彙總＝該區多數還缺門牌座標；縣市大氣泡＝遠距聚合（ZIP 建索引後立即可見）。
+                覆蓋統計會分批掃描索引（避免 504）。完成後縣市精準數／TGOS 數才會更新。
             </p>
         </section>
         <?php endif; /* coverage */ ?>
@@ -1499,20 +1769,25 @@ function searchTextLower(string $value): string
                         </label>
                     </div>
                 </section>
-                <form class="card compact-card" method="post">
+                <form class="card compact-card js-busy-submit" method="post"
+                      data-busy-label="檢查中…"
+                      data-busy-status="正在檢查官方是否有更新…">
                     <input type="hidden" name="action" value="check_realprice">
                     <p>只讀取官方檔案資訊，不下載 ZIP。</p>
+                    <div class="doorplate-upload-progress form-busy-progress" hidden>
+                        <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                        <p class="muted form-busy-status" aria-live="polite">準備檢查…</p>
+                    </div>
                     <div class="actions">
                         <button class="button" type="submit">檢查官方更新</button>
                     </div>
                 </form>
-                <form class="card compact-card" method="post">
-                    <input type="hidden" name="action" value="rebuild_realprice">
-                    <p>與上方相同：掃描 <code>seasons/*.zip</code>（含手動檔）與本期 ZIP，重建地圖索引。</p>
+                <div class="card compact-card">
+                    <p>與上方相同：掃描 <code>seasons/*.zip</code>（含手動檔）與本期 ZIP，分批重建地圖索引。</p>
                     <div class="actions">
-                        <button class="button" type="submit"<?= ((int) ($realpriceStatus['season_zip_count'] ?? 0) > 0 || !empty($realpriceStatus['zip_exists'])) ? '' : ' disabled' ?>>只重建索引</button>
+                        <button class="button" type="button" id="realpriceIndexBtnAdvanced"<?= ((int) ($realpriceStatus['season_zip_count'] ?? 0) > 0 || !empty($realpriceStatus['zip_exists'])) ? '' : ' disabled' ?>>只重建索引（分批）</button>
                     </div>
-                </form>
+                </div>
             </div>
         </details>
         <?php endif; /* data (advanced) */ ?>
@@ -1536,24 +1811,68 @@ function searchTextLower(string $value): string
             <?php elseif (($matchJob['status'] ?? '') === 'done' && (string) ($matchJob['message'] ?? '') !== ''): ?>
                 <div class="notice">上次比對結果：<?= h((string) $matchJob['message']) ?></div>
             <?php endif; ?>
-            <div class="form-grid">
-                <?php foreach (($doorplateStatus['cities'] ?? []) as $city): ?>
-                    <label class="wide">
-                        <?= h((string) ($city['label'] ?? $city['key'])) ?>
-                        <input type="text" readonly value="<?= h(
-                            ((bool) ($city['file_exists'] ?? false)
-                                ? ('已有檔案 ' . realpriceHumanSize((int) ($city['file_size'] ?? 0)))
-                                : '尚未下載')
-                            . ((string) ($city['matched_at'] ?? '') !== ''
-                                ? ('；上次比對寫入 ' . number_format((int) ($city['matched_count'] ?? 0)) . ' 筆（掃描 ' . number_format((int) ($city['scanned_rows'] ?? 0)) . ' 列）')
-                                : '；尚未執行比對')
-                        ) ?>">
-                        <small class="muted"><?= h((string) ($city['note'] ?? '')) ?> · <a href="<?= h((string) ($city['dataset'] ?? '#')) ?>" target="_blank" rel="noopener">資料集</a></small>
-                    </label>
-                <?php endforeach; ?>
+            <div class="analytics-table-wrap mt-tight">
+                <table id="doorplateCityStatusTable">
+                    <thead>
+                        <tr>
+                            <th>縣市</th>
+                            <th>取得方式</th>
+                            <th>本機檔案</th>
+                            <th>上次比對</th>
+                            <th>寫入／掃描</th>
+                            <th>資料集</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach (($doorplateStatus['cities'] ?? []) as $city): ?>
+                            <?php
+                            $hasFile = (bool) ($city['file_exists'] ?? false);
+                            $matchedAt = (string) ($city['matched_at'] ?? '');
+                            $manualOnly = (bool) ($city['manual_only'] ?? false);
+                            $note = trim((string) ($city['note'] ?? ''));
+                            $getLabel = $manualOnly ? '手動上傳' : '可自動下載';
+                            ?>
+                            <tr>
+                                <td><?= h((string) ($city['label'] ?? $city['key'])) ?></td>
+                                <td>
+                                    <span class="season-index-status <?= $manualOnly ? 'is-pending' : 'is-ok' ?>"><?= h($getLabel) ?></span>
+                                    <?php if ($note !== ''): ?>
+                                        <small class="muted"><?= h($note) ?></small>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ($hasFile): ?>
+                                        <span class="season-index-status is-ok">已有</span>
+                                        <?= h(realpriceHumanSize((int) ($city['file_size'] ?? 0))) ?>
+                                    <?php else: ?>
+                                        <span class="season-index-status is-pending">尚未下載</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?= h($matchedAt !== '' ? date('Y-m-d H:i', strtotime($matchedAt) ?: time()) : '尚未比對') ?></td>
+                                <td>
+                                    <?php if ($matchedAt !== ''): ?>
+                                        <?= h(number_format((int) ($city['matched_count'] ?? 0))) ?>／<?= h(number_format((int) ($city['scanned_rows'] ?? 0))) ?>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ((string) ($city['dataset'] ?? '') !== ''): ?>
+                                        <a href="<?= h((string) $city['dataset']) ?>" target="_blank" rel="noopener">開啟</a>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
             </div>
+            <p class="muted">此表只看<strong>各縣市門牌檔是否就緒、上次比對寫入多少</strong>；真正執行比對請用下方勾選縣市後按「執行本機門牌比對」。</p>
         </section>
-        <form class="card compact-card" method="post">
+        <form class="card compact-card js-busy-submit" method="post"
+              data-busy-label="下載中…"
+              data-busy-status="正在下載門牌開放資料，檔案可能很大請耐心等候…">
             <input type="hidden" name="action" value="download_doorplate">
             <p>下載可直連的縣市門牌 CSV（檔案可能數十到上百 MB，請耐心等候）。</p>
             <div class="form-grid">
@@ -1567,6 +1886,10 @@ function searchTextLower(string $value): string
                         <?php endforeach; ?>
                     </select>
                 </label>
+            </div>
+            <div class="doorplate-upload-progress form-busy-progress" hidden>
+                <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                <p class="muted form-busy-status" aria-live="polite">準備下載…</p>
             </div>
             <div class="actions">
                 <button class="primary" type="submit">下載門牌開放資料</button>
@@ -1679,11 +2002,11 @@ function searchTextLower(string $value): string
                 </label>
                 <label>
                     上次匯入
-                    <input type="text" value="<?= h((string) (($tgosState['last_import_at'] ?? '') ?: '尚未匯入')) ?>" readonly>
+                    <input id="tgosLastImportAt" type="text" value="<?= h((string) (($tgosState['last_import_at'] ?? '') ?: '尚未匯入')) ?>" readonly>
                 </label>
                 <label>
                     上次匯入寫入
-                    <input type="text" value="<?= h(number_format((int) ($tgosState['last_import_matched'] ?? 0)) . ' 筆') ?>" readonly>
+                    <input id="tgosLastImportMatched" type="text" value="<?= h(number_format((int) ($tgosState['last_import_matched'] ?? 0)) . ' 筆') ?>" readonly>
                 </label>
                 <label>
                     即時 QueryAddr
@@ -1691,7 +2014,10 @@ function searchTextLower(string $value): string
                 </label>
             </div>
         </section>
-        <form class="card compact-card" method="post">
+        <form class="card compact-card js-busy-submit" method="post" id="tgosExportForm"
+              data-busy-label="匯出中…"
+              data-busy-status="正在掃描待定位地址並產生 CSV，請稍候…"
+              data-busy-mode="tgos-export">
             <input type="hidden" name="action" value="export_tgos_batch">
             <p>匯出<strong>尚無精準門牌座標</strong>的不重複地址。請先盡量跑完本機門牌比對，再匯出剩餘缺口。</p>
             <div class="form-grid">
@@ -1712,28 +2038,42 @@ function searchTextLower(string $value): string
                 <label>
                     編碼
                     <select name="tgos_encoding">
-                        <option value="utf-8" selected>UTF-8（建議）</option>
-                        <option value="big5">Big5（舊版上傳若失敗再試）</option>
+                        <option value="big5" selected>Big5（TGOS 建議）</option>
+                        <option value="utf-8">UTF-8（無 BOM）</option>
                     </select>
                 </label>
+            </div>
+            <div class="doorplate-upload-progress form-busy-progress" hidden>
+                <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                <p class="muted form-busy-status" aria-live="polite">準備匯出…</p>
             </div>
             <div class="actions">
                 <button class="primary" type="submit"<?= $realpriceStatus['index_exists'] ? '' : ' disabled' ?>>匯出 TGOS 上傳 CSV</button>
             </div>
-            <p class="muted">格式：<code>id,Address,Response_Address,Response_X,Response_Y</code>。系統會另外保存 id 對照檔，匯入時自動對回 geocode key。</p>
+            <p class="muted">格式依 TGOS 範本：<code>id,Address,Response_Address,Response_X,Response_Y</code>（剛好 5 欄）。地址內逗號會自動改成頓號，避免 TGOS「欄位數量不正確」。系統另存 id 對照檔供匯入。</p>
         </form>
-        <form class="card compact-card" method="post" enctype="multipart/form-data">
+        <form class="card compact-card js-busy-submit" method="post" enctype="multipart/form-data" id="tgosImportForm"
+              data-busy-label="匯入中…"
+              data-busy-status="正在上傳並分批寫入座標快取，請稍候…"
+              data-busy-mode="tgos-import">
             <input type="hidden" name="action" value="import_tgos_batch">
-            <p>把 TGOS email 連結下載的結果 CSV 上傳回來。會寫入座標快取（來源標記為 TGOS），不會覆蓋本機門牌／手動座標。</p>
+            <p>把 TGOS email 連結下載的結果 CSV 上傳回來。會<strong>分批</strong>寫入座標快取（來源標記為 TGOS），不會覆蓋本機門牌／手動座標。</p>
+            <div id="tgosImportResultNotice" class="notice" hidden></div>
             <div class="form-grid">
                 <label class="wide">
                     TGOS 結果 CSV
                     <input type="file" name="tgos_result_csv" accept=".csv,text/csv" required>
                 </label>
             </div>
+            <div class="doorplate-upload-progress form-busy-progress" hidden>
+                <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                <p class="muted form-busy-status" aria-live="polite">準備匯入…</p>
+            </div>
             <div class="actions">
                 <button class="primary" type="submit">匯入 TGOS 結果</button>
+                <button type="button" id="tgosImportCancelBtn" hidden>取消匯入</button>
             </div>
+            <p class="muted">約每批 300 筆（寫入輕量 TGOS 增量快取，不再重寫整份座標庫）。完成後請到「定位覆蓋」按「更新覆蓋統計」才會看到精準數變化。</p>
         </form>
         <?php endif; /* tgos */ ?>
 
@@ -1798,7 +2138,9 @@ function searchTextLower(string $value): string
             </div>
             <p class="muted" id="realpriceGeocodeAutoStatus">自動定位需保持此頁開啟；離開頁面會停止，但已完成進度會保留，回來可再按一次續跑。</p>
         </form>
-        <form class="card compact-card" method="post">
+        <form class="card compact-card js-busy-submit" method="post"
+              data-busy-label="清理中…"
+              data-busy-status="正在清理誤標座標並重建佇列…">
             <input type="hidden" name="action" value="repair_realprice_geocode">
             <p>若地圖上看到很多不同單價卻疊在行政區中心（例如桃園區中心），代表舊快取把「門牌」誤存成「行政區」。按下方按鈕可清理誤標並重建待定位佇列。</p>
             <div class="form-grid">
@@ -1807,6 +2149,10 @@ function searchTextLower(string $value): string
                     <input type="number" name="queue_limit" min="100" max="10000" step="100" value="3000">
                 </label>
             </div>
+            <div class="doorplate-upload-progress form-busy-progress" hidden>
+                <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                <p class="muted form-busy-status" aria-live="polite">準備清理…</p>
+            </div>
             <div class="actions">
                 <button class="button" type="submit"<?= $realpriceStatus['index_exists'] ? '' : ' disabled' ?>>清理誤標座標並重建佇列</button>
             </div>
@@ -1814,7 +2160,9 @@ function searchTextLower(string $value): string
         <details class="admin-fold">
             <summary>地址定位進階維護</summary>
             <div class="admin-fold-body">
-                <form class="card compact-card" method="post">
+                <form class="card compact-card js-busy-submit" method="post"
+                      data-busy-label="建立中…"
+                      data-busy-status="正在建立／重建定位佇列…">
                     <input type="hidden" name="action" value="prepare_realprice_geocode">
                     <p>手動建立待定位佇列。一般使用上方「檢查並自動定位全部」即可。</p>
                     <div class="form-grid">
@@ -1823,13 +2171,23 @@ function searchTextLower(string $value): string
                             <input type="number" name="queue_limit" min="50" max="10000" step="50" value="1000">
                         </label>
                     </div>
+                    <div class="doorplate-upload-progress form-busy-progress" hidden>
+                        <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                        <p class="muted form-busy-status" aria-live="polite">準備建立佇列…</p>
+                    </div>
                     <div class="actions">
                         <button class="button" type="submit"<?= $realpriceStatus['index_exists'] ? '' : ' disabled' ?>>建立 / 重建定位佇列</button>
                     </div>
                 </form>
-                <form class="card compact-card" method="post">
+                <form class="card compact-card js-busy-submit" method="post"
+                      data-busy-label="處理中…"
+                      data-busy-status="正在處理下一批定位…">
                     <input type="hidden" name="action" value="process_realprice_geocode">
                     <p>手動處理下一批定位，用於測試或限流後小量續跑。</p>
+                    <div class="doorplate-upload-progress form-busy-progress" hidden>
+                        <div class="doorplate-upload-bar form-busy-bar is-indeterminate"><span></span></div>
+                        <p class="muted form-busy-status" aria-live="polite">準備處理…</p>
+                    </div>
                     <div class="actions">
                         <button class="button" type="submit"<?= ((int) ($realpriceGeocodeStats['pending_count'] ?? 0) > 0 && !(bool) ($realpriceGeocodeStats['is_rate_limited'] ?? false)) ? '' : ' disabled' ?>>處理下一批定位</button>
                         <button class="button" type="button" id="realpriceGeocodeAutoBtn"<?= ((int) ($realpriceGeocodeStats['pending_count'] ?? 0) > 0 && !(bool) ($realpriceGeocodeStats['is_rate_limited'] ?? false)) ? '' : ' disabled' ?>>自動批次處理既有佇列</button>
@@ -2704,23 +3062,312 @@ function searchTextLower(string $value): string
     });
 
     document.querySelectorAll('form.js-busy-submit').forEach((busyForm) => {
-        busyForm.addEventListener('submit', () => {
+        const setFormBusy = (busy, message = '') => {
             const submitter = busyForm.querySelector('button[type="submit"], input[type="submit"]');
+            const progress = busyForm.querySelector('.form-busy-progress');
             const status = busyForm.querySelector('.form-busy-status');
+            const bar = busyForm.querySelector('.form-busy-bar');
             if (submitter) {
-                submitter.dataset.idleLabel = submitter.textContent || submitter.value || '';
-                submitter.disabled = true;
-                if (submitter instanceof HTMLButtonElement) {
-                    submitter.textContent = busyForm.dataset.busyLabel || '處理中…';
-                } else {
-                    submitter.value = busyForm.dataset.busyLabel || '處理中…';
+                if (!submitter.dataset.idleLabel) {
+                    submitter.dataset.idleLabel = submitter.textContent || submitter.value || '';
                 }
+                submitter.disabled = busy;
+                const label = busy
+                    ? (busyForm.dataset.busyLabel || '處理中…')
+                    : submitter.dataset.idleLabel;
+                if (submitter instanceof HTMLButtonElement) submitter.textContent = label;
+                else submitter.value = label;
             }
+            if (progress) progress.hidden = !busy && !message;
+            if (bar) bar.classList.toggle('is-indeterminate', busy);
             if (status) {
-                status.textContent = busyForm.dataset.busyStatus || '處理中，請稍候…';
                 status.hidden = false;
+                status.textContent = message || (busy
+                    ? (busyForm.dataset.busyStatus || '處理中，請稍候…')
+                    : '');
+                if (!busy && !message) status.hidden = true;
             }
-            busyForm.setAttribute('aria-busy', 'true');
+            busyForm.setAttribute('aria-busy', busy ? 'true' : 'false');
+        };
+
+        const mode = String(busyForm.dataset.busyMode || '');
+        if (mode === 'coverage-refresh') {
+            busyForm.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                if (busyForm.getAttribute('aria-busy') === 'true') return;
+                setFormBusy(true, '開始分批統計覆蓋…');
+                const body = new FormData(busyForm);
+                body.set('ajax', '1');
+                try {
+                    const response = await fetch(`${window.location.pathname}?tab=realprice&rp=coverage`, {
+                        method: 'POST',
+                        headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                        body,
+                        credentials: 'same-origin',
+                    });
+                    const rawText = await response.text();
+                    let payload = {};
+                    try { payload = rawText ? JSON.parse(rawText) : {}; } catch (_) { payload = {}; }
+                    if (!response.ok || payload.ok !== true) {
+                        if (!payload.message && response.ok && !String(rawText || '').trim().startsWith('{')) {
+                            throw new Error('伺服器沒有回傳統計結果（可能逾時）。請再試一次或改用內網後台。');
+                        }
+                        throw new Error(payload.message || `HTTP ${response.status}`);
+                    }
+
+                    const cancelBtn = document.querySelector('#coverageRefreshCancelBtn');
+                    let cancelled = false;
+                    const postChunk = async () => {
+                        const chunkBody = new FormData();
+                        chunkBody.set('action', 'refresh_realprice_coverage_chunk');
+                        chunkBody.set('ajax', '1');
+                        chunkBody.set('budget_ms', '12000');
+                        const chunkRes = await fetch(`${window.location.pathname}?tab=realprice&rp=coverage`, {
+                            method: 'POST',
+                            headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                            body: chunkBody,
+                            credentials: 'same-origin',
+                        });
+                        const chunkText = await chunkRes.text();
+                        let chunkPayload = {};
+                        try { chunkPayload = chunkText ? JSON.parse(chunkText) : {}; } catch (_) { chunkPayload = {}; }
+                        if (!chunkRes.ok || chunkPayload.ok !== true) {
+                            const snippet = String(chunkText || '').replace(/\s+/g, ' ').slice(0, 160);
+                            if (!chunkPayload.message && chunkRes.ok && !String(chunkText || '').trim().startsWith('{')) {
+                                throw new Error('分批統計沒有回傳 JSON（可能逾時）。請再試一次。' + (snippet ? ` 回應片段：${snippet}` : ''));
+                            }
+                            throw new Error(chunkPayload.message || `分批統計失敗 HTTP ${chunkRes.status}`);
+                        }
+                        return chunkPayload;
+                    };
+
+                    if (cancelBtn) {
+                        cancelBtn.hidden = false;
+                        cancelBtn.onclick = async () => {
+                            cancelled = true;
+                            try {
+                                const cancelBody = new FormData();
+                                cancelBody.set('action', 'refresh_realprice_coverage_cancel');
+                                cancelBody.set('ajax', '1');
+                                await fetch(`${window.location.pathname}?tab=realprice&rp=coverage`, {
+                                    method: 'POST',
+                                    headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                                    body: cancelBody,
+                                    credentials: 'same-origin',
+                                });
+                            } catch (_) {}
+                        };
+                    }
+
+                    let last = payload;
+                    let guard = 0;
+                    while (!cancelled && !last.done && guard < 5000) {
+                        guard += 1;
+                        const job = last.job || {};
+                        const pct = Number(job.pct || 0);
+                        setFormBusy(true, String(last.message || job.message || `統計中 ${pct}%…`));
+                        const bar = busyForm.querySelector('.form-busy-bar');
+                        if (bar) {
+                            bar.classList.remove('is-indeterminate');
+                            const span = bar.querySelector('span');
+                            if (span) span.style.width = `${Math.max(2, Math.min(100, pct))}%`;
+                        }
+                        last = await postChunk();
+                    }
+                    if (cancelBtn) cancelBtn.hidden = true;
+
+                    const summary = last.message || (cancelled ? '已取消覆蓋統計。' : '覆蓋統計完成。');
+                    setFormBusy(false, summary);
+                    if (!cancelled) {
+                        window.setTimeout(() => {
+                            window.location.href = `${window.location.pathname}?tab=realprice&rp=coverage`;
+                        }, 800);
+                    }
+                } catch (error) {
+                    setFormBusy(false, error.message || '統計失敗');
+                    const status = busyForm.querySelector('.form-busy-status');
+                    if (status) {
+                        status.hidden = false;
+                        status.textContent = error.message || '統計失敗';
+                    }
+                    const progress = busyForm.querySelector('.form-busy-progress');
+                    if (progress) progress.hidden = false;
+                    const cancelBtn = document.querySelector('#coverageRefreshCancelBtn');
+                    if (cancelBtn) cancelBtn.hidden = true;
+                }
+            });
+            return;
+        }
+
+        if (mode === 'tgos-export' || mode === 'tgos-import') {
+            busyForm.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                if (busyForm.getAttribute('aria-busy') === 'true') return;
+                setFormBusy(true);
+                const body = new FormData(busyForm);
+                body.set('ajax', '1');
+                try {
+                    const response = await fetch(`${window.location.pathname}?tab=realprice&rp=tgos`, {
+                        method: 'POST',
+                        headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                        body,
+                        credentials: 'same-origin',
+                    });
+                    let payload = {};
+                    const rawText = await response.text();
+                    try {
+                        payload = rawText ? JSON.parse(rawText) : {};
+                    } catch (_) {
+                        payload = {};
+                    }
+                    if (!response.ok || payload.ok !== true) {
+                        if (!payload.message && response.ok && !rawText.trim().startsWith('{')) {
+                            throw new Error('伺服器沒有回傳匯入結果（可能處理過久被切斷）。請往上看「上次匯入／寫入筆數」確認是否已寫入；若仍是「尚未匯入」請再試一次或改用內網後台。');
+                        }
+                        throw new Error(payload.message || `HTTP ${response.status}`);
+                    }
+                    if (mode === 'tgos-export') {
+                        setFormBusy(false, payload.message || '匯出完成，開始下載…');
+                        const filename = String(payload.filename || '');
+                        if (filename) {
+                            const link = document.createElement('a');
+                            link.href = `${window.location.pathname}?tab=realprice&rp=tgos&tgos_dl=${encodeURIComponent(filename)}`;
+                            link.rel = 'noopener';
+                            document.body.appendChild(link);
+                            link.click();
+                            link.remove();
+                        }
+                        window.setTimeout(() => {
+                            window.location.href = `${window.location.pathname}?tab=realprice&rp=tgos`;
+                        }, 1200);
+                        return;
+                    }
+
+                    // Chunked TGOS import
+                    const cancelBtn = document.querySelector('#tgosImportCancelBtn');
+                    let cancelled = false;
+                    const postChunk = async () => {
+                        const chunkBody = new FormData();
+                        chunkBody.set('action', 'import_tgos_chunk');
+                        chunkBody.set('ajax', '1');
+                        chunkBody.set('limit', '300');
+                        const chunkRes = await fetch(`${window.location.pathname}?tab=realprice&rp=tgos`, {
+                            method: 'POST',
+                            headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                            body: chunkBody,
+                            credentials: 'same-origin',
+                        });
+                        const chunkText = await chunkRes.text();
+                        let chunkPayload = {};
+                        try { chunkPayload = chunkText ? JSON.parse(chunkText) : {}; } catch (_) { chunkPayload = {}; }
+                        if (!chunkRes.ok || chunkPayload.ok !== true) {
+                            const snippet = String(chunkText || '').replace(/\s+/g, ' ').slice(0, 160);
+                            if (!chunkPayload.message && chunkRes.ok && !String(chunkText || '').trim().startsWith('{')) {
+                                throw new Error('分批寫入沒有回傳 JSON（可能記憶體不足或逾時）。請改用內網後台再試。' + (snippet ? ` 回應片段：${snippet}` : ''));
+                            }
+                            throw new Error(chunkPayload.message || `分批寫入失敗 HTTP ${chunkRes.status}`);
+                        }
+                        return chunkPayload;
+                    };
+
+                    if (cancelBtn) {
+                        cancelBtn.hidden = false;
+                        cancelBtn.onclick = async () => {
+                            cancelled = true;
+                            try {
+                                const cancelBody = new FormData();
+                                cancelBody.set('action', 'import_tgos_cancel');
+                                cancelBody.set('ajax', '1');
+                                await fetch(`${window.location.pathname}?tab=realprice&rp=tgos`, {
+                                    method: 'POST',
+                                    headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                                    body: cancelBody,
+                                    credentials: 'same-origin',
+                                });
+                            } catch (_) {}
+                        };
+                    }
+
+                    let last = payload;
+                    let guard = 0;
+                    while (!cancelled && !last.done && guard < 500) {
+                        guard += 1;
+                        const job = last.job || {};
+                        const pct = Number(job.pct || 0);
+                        const offset = Number(job.offset || 0);
+                        const total = Number(job.total || 0);
+                        const matched = Number(job.matched || 0);
+                        setFormBusy(true, `匯入中 ${offset.toLocaleString('zh-TW')} / ${total.toLocaleString('zh-TW')}（${pct}%），已寫入 ${matched.toLocaleString('zh-TW')} 筆…`);
+                        const bar = busyForm.querySelector('.form-busy-bar');
+                        if (bar) {
+                            bar.classList.remove('is-indeterminate');
+                            const span = bar.querySelector('span');
+                            if (span) span.style.width = `${Math.max(2, Math.min(100, pct))}%`;
+                        }
+                        last = await postChunk();
+                    }
+                    if (cancelBtn) cancelBtn.hidden = true;
+
+                    const job = last.job || {};
+                    const result = {
+                        matched: Number(job.matched || 0),
+                        skipped: Number(job.skipped || 0),
+                        failed: Number(job.failed || 0),
+                    };
+                    const summary = last.message
+                        || `TGOS 匯入完成：寫入 ${result.matched.toLocaleString('zh-TW')} 筆`
+                            + (result.skipped > 0 ? `，略過 ${result.skipped.toLocaleString('zh-TW')} 筆` : '')
+                            + (result.failed > 0 ? `，失敗 ${result.failed.toLocaleString('zh-TW')} 筆` : '')
+                            + '。';
+                    setFormBusy(false, summary);
+                    const noticeHost = document.querySelector('#tgosImportResultNotice');
+                    if (noticeHost) {
+                        noticeHost.hidden = false;
+                        noticeHost.className = cancelled ? 'notice error' : 'notice';
+                        noticeHost.textContent = summary;
+                    }
+                    const state = (last.state && typeof last.state === 'object') ? last.state : {};
+                    const importAt = document.querySelector('#tgosLastImportAt');
+                    const importMatched = document.querySelector('#tgosLastImportMatched');
+                    if (importAt && (state.last_import_at || result.matched > 0)) {
+                        importAt.value = state.last_import_at || new Date().toLocaleString('zh-TW');
+                    }
+                    if (importMatched) {
+                        importMatched.value = `${Number(state.last_import_matched ?? result.matched).toLocaleString('zh-TW')} 筆`;
+                    }
+                    if (window.Swal && !cancelled) {
+                        await Swal.fire({
+                            icon: 'success',
+                            title: 'TGOS 匯入完成',
+                            html: `<p style="text-align:left;line-height:1.6">${escapeHtml(summary)}</p>`
+                                + `<p style="text-align:left;margin-top:8px">寫入 <strong>${result.matched.toLocaleString('zh-TW')}</strong>`
+                                + `　略過 <strong>${result.skipped.toLocaleString('zh-TW')}</strong>`
+                                + `　失敗 <strong>${result.failed.toLocaleString('zh-TW')}</strong></p>`
+                                + `<p style="text-align:left;margin-top:8px;opacity:.8">接著到「定位覆蓋」按「更新覆蓋統計」才會更新精準數。</p>`,
+                            confirmButtonText: '知道了',
+                            confirmButtonColor: '#3ec9ae',
+                        });
+                    }
+                    window.setTimeout(() => {
+                        window.location.href = `${window.location.pathname}?tab=realprice&rp=tgos`;
+                    }, 1200);
+                    return;
+                } catch (error) {
+                    setFormBusy(false, error.message || '操作失敗');
+                    const status = busyForm.querySelector('.form-busy-status');
+                    if (status) {
+                        status.hidden = false;
+                        status.textContent = error.message || '操作失敗';
+                    }
+                    const progress = busyForm.querySelector('.form-busy-progress');
+                    if (progress) progress.hidden = false;
+                }
+            });
+            return;
+        }
+
+        busyForm.addEventListener('submit', () => {
+            setFormBusy(true);
         });
     });
 
@@ -3926,6 +4573,212 @@ function searchTextLower(string $value): string
 
         xhr.send(body);
     });
+})();
+
+(() => {
+    const indexBtn = document.querySelector('#realpriceIndexBtn');
+    const indexAllBtn = document.querySelector('#realpriceIndexAllBtn');
+    const indexBtnAdvanced = document.querySelector('#realpriceIndexBtnAdvanced');
+    const cancelBtn = document.querySelector('#realpriceIndexCancelBtn');
+    const progressWrap = document.querySelector('#realpriceIndexProgress');
+    const progressBar = document.querySelector('#realpriceIndexBar');
+    const statusText = document.querySelector('#realpriceIndexStatusText');
+    const checkAll = document.querySelector('#realpriceSeasonCheckAll');
+    if (!indexBtn && !indexBtnAdvanced && !indexAllBtn) return;
+
+    checkAll?.addEventListener('change', () => {
+        document.querySelectorAll('.realprice-season-check').forEach((el) => {
+            el.checked = !!checkAll.checked;
+        });
+    });
+
+    const selectedSeasons = () => Array.from(document.querySelectorAll('.realprice-season-check:checked'))
+        .map((el) => String(el.value || ''))
+        .filter(Boolean);
+
+    const sleep = (ms) => new Promise((r) => window.setTimeout(r, ms));
+
+    const postJson = async (fields, { timeoutMs = 35000 } = {}) => {
+        const body = new FormData();
+        Object.entries(fields || {}).forEach(([key, value]) => {
+            if (Array.isArray(value)) value.forEach((item) => body.append(`${key}[]`, String(item)));
+            else if (value !== undefined && value !== null) body.append(key, String(value));
+        });
+        body.set('ajax', '1');
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+        let response;
+        try {
+            response = await fetch(`${window.location.pathname}?tab=realprice&rp=data`, {
+                method: 'POST',
+                headers: { Accept: 'application/json', 'X-Requested-With': 'fetch' },
+                body,
+                credentials: 'same-origin',
+                signal: controller.signal,
+            });
+        } catch (error) {
+            window.clearTimeout(timer);
+            const err = new Error(error?.name === 'AbortError'
+                ? '請求逾時，改為讀取伺服器進度…'
+                : (error?.message || '網路錯誤'));
+            err.code = error?.name === 'AbortError' ? 'timeout' : 'network';
+            throw err;
+        }
+        window.clearTimeout(timer);
+        let payload = {};
+        try { payload = await response.json(); } catch (_) { payload = {}; }
+        if (!response.ok || payload.ok !== true) {
+            const err = new Error(payload.message || `HTTP ${response.status}`);
+            err.code = 'http';
+            throw err;
+        }
+        return payload;
+    };
+
+    const readStatus = async () => {
+        try {
+            return await postJson({ action: 'rebuild_realprice_status' }, { timeoutMs: 20000 });
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const setUi = (payload, { running = false } = {}) => {
+        const job = payload?.job || {};
+        const pct = Math.max(0, Math.min(100, Number(job.pct || 0)));
+        if (progressWrap) progressWrap.hidden = false;
+        if (progressBar) progressBar.style.width = `${pct}%`;
+        if (statusText) statusText.textContent = String(payload?.message || job.message || '處理中…');
+        if (cancelBtn) cancelBtn.hidden = !running;
+        [indexBtn, indexAllBtn, indexBtnAdvanced].forEach((btn) => {
+            if (!btn) return;
+            btn.disabled = running;
+        });
+        if (indexBtn) indexBtn.textContent = running ? '重建中…' : '重建勾選季度索引';
+        if (indexAllBtn) indexAllBtn.textContent = running ? '重建中…' : '全部季度重建';
+        if (indexBtnAdvanced) indexBtnAdvanced.textContent = running ? '重建中…' : '只重建索引（分批）';
+    };
+
+    let looping = false;
+    const pumpChunks = async (initialPayload = null) => {
+        let payload = initialPayload;
+        while (true) {
+            if (!payload || !payload.done) {
+                try {
+                    payload = await postJson({ action: 'rebuild_realprice_chunk' }, { timeoutMs: 35000 });
+                } catch (error) {
+                    const statusPayload = await readStatus();
+                    if (statusPayload) {
+                        setUi(statusPayload, { running: !statusPayload.done });
+                        if (statusPayload.done) {
+                            payload = statusPayload;
+                            break;
+                        }
+                        if (statusText) {
+                            statusText.textContent = `${error.message || '批次逾時'}；繼續中…`;
+                        }
+                        await sleep(1200);
+                        continue;
+                    }
+                    if (statusText) {
+                        statusText.textContent = `${error.message || '連線異常'}；3 秒後重試…`;
+                    }
+                    await sleep(3000);
+                    continue;
+                }
+            }
+            setUi(payload, { running: !payload.done });
+            if (payload.done) break;
+            if (payload.busy) await sleep(800);
+        }
+        return payload;
+    };
+
+    const runLoop = async ({ all = false } = {}) => {
+        if (looping) return;
+        const seasons = all ? [] : selectedSeasons();
+        if (!all && seasons.length === 0) {
+            window.alert('請至少勾選一個季度 ZIP。');
+            return;
+        }
+        looping = true;
+        try {
+            setUi({ message: '建立分批索引工作…', job: { pct: 0 } }, { running: true });
+            const startFields = { action: 'rebuild_realprice_start' };
+            if (!all) startFields.seasons = seasons;
+            let payload = null;
+            try {
+                payload = await postJson(startFields, { timeoutMs: 35000 });
+            } catch (error) {
+                // Start may have succeeded server-side even if the browser timed out.
+                payload = await readStatus();
+                if (!payload || payload.done || payload.job?.status !== 'running') {
+                    throw error;
+                }
+                if (statusText) {
+                    statusText.textContent = '連線逾時，但伺服器工作仍在，改為續跑…';
+                }
+            }
+            setUi(payload, { running: true });
+            payload = await pumpChunks(payload?.done ? payload : null);
+            setUi(payload, { running: false });
+            if (payload.cancelled) return;
+            if (statusText) statusText.textContent = payload.message || '索引重建完成。';
+            // Soft notice instead of blocking alert.
+            window.setTimeout(() => {
+                window.location.href = `${window.location.pathname}?tab=realprice&rp=data`;
+            }, 800);
+        } catch (error) {
+            setUi({ message: error.message || '索引重建失敗', job: { pct: 0 } }, { running: false });
+            if (statusText) statusText.textContent = error.message || '索引重建失敗';
+        } finally {
+            looping = false;
+        }
+    };
+
+    indexBtn?.addEventListener('click', (event) => {
+        event.preventDefault();
+        runLoop({ all: false });
+    });
+    indexAllBtn?.addEventListener('click', (event) => {
+        event.preventDefault();
+        runLoop({ all: true });
+    });
+    indexBtnAdvanced?.addEventListener('click', (event) => {
+        event.preventDefault();
+        runLoop({ all: true });
+    });
+
+    cancelBtn?.addEventListener('click', async (event) => {
+        event.preventDefault();
+        try {
+            const payload = await postJson({ action: 'rebuild_realprice_cancel' }, { timeoutMs: 30000 });
+            setUi(payload, { running: false });
+        } catch (error) {
+            if (statusText) statusText.textContent = error.message || '取消失敗';
+        }
+    });
+
+    (async () => {
+        try {
+            const statusPayload = await readStatus();
+            if (statusPayload && !statusPayload.done && statusPayload.job?.status === 'running') {
+                setUi(statusPayload, { running: true });
+                looping = true;
+                try {
+                    const payload = await pumpChunks(null);
+                    setUi(payload, { running: false });
+                    if (!payload.cancelled) {
+                        window.setTimeout(() => {
+                            window.location.href = `${window.location.pathname}?tab=realprice&rp=data`;
+                        }, 800);
+                    }
+                } finally {
+                    looping = false;
+                }
+            }
+        } catch (_) {}
+    })();
 })();
 </script>
 </body>
